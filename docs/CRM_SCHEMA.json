@@ -1,0 +1,66 @@
+{
+  "schema_version": "1.0",
+  "name": "SaaS CRM",
+  "industry": "saas",
+  "entities": [
+    {
+      "name": "lead",
+      "label": "Lead",
+      "fields": [
+        {
+          "name": "full_name",
+          "label": "Full Name",
+          "type": "text",
+          "required": true
+        },
+        {
+          "name": "email",
+          "label": "Email",
+          "type": "email",
+          "required": false
+        },
+        {
+          "name": "company",
+          "label": "Company",
+          "type": "text",
+          "required": false
+        },
+        {
+          "name": "source",
+          "label": "Lead Source",
+          "type": "select",
+          "required": true,
+          "options": [
+            "Website",
+            "WhatsApp",
+            "CSV",
+            "Manual",
+            "API"
+          ]
+        },
+        {
+          "name": "status",
+          "label": "Lead Status",
+          "type": "select",
+          "required": true,
+          "options": [
+            "New",
+            "Qualified",
+            "Demo",
+            "Proposal",
+            "Won",
+            "Lost"
+          ]
+        }
+      ]
+    }
+  ],
+  "pipeline_stages": [
+    "New",
+    "Qualified",
+    "Demo",
+    "Proposal",
+    "Won",
+    "Lost"
+  ]
+}
