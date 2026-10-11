@@ -26,3 +26,19 @@ Read `docs/API_CONTRACTS.md`, `docs/CRM_SCHEMA.json`, and the relevant task file
 - Add tests for new behavior and run them before claiming completion.
 - Do not commit `.env` or secrets.
 - Report changed files, commands run, test results and remaining limitations.
+
+## Security and authorization
+- Read the API contract and assigned member task before coding.
+- Never change shared schemas or endpoint contracts without team agreement.
+- Never commit `.env` files, API keys, tokens, passwords, or Supabase service-role credentials.
+- Never bypass authentication or authorization for convenience.
+- Never use AI-generated SQL or code as executable instructions.
+- Validate all incoming data against the CRM configuration before persistence.
+- Never return secrets, raw database errors, or stack traces to the client.
+
+## Development practices
+- Use mock data when another module is not ready.
+- Add tests for new functionality and report actual test results.
+- Keep generated OpenAPI documentation aligned with the API contract.
+- Use lowercase machine identifiers for entity names in API paths (e.g., `/records/lead`, not `/records/Lead`).
+- Distinguish CRM generation (draft), CRM saving (persistence), and CRM activation (operational use).
