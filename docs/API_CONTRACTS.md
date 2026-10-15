@@ -513,7 +513,7 @@ Request:
 ```json
 {
   "name": "Follow up after new lead",
-  "trigger": {"event": "record.created", "entity": "lead"},
+  "trigger": {"type": "record.created", "entity": "lead"},
   "actions": [
     {
       "type": "create_follow_up_task",
@@ -686,7 +686,7 @@ Error responses:
 - `404 NOT_FOUND`: Proposal not found or caller is not the CRM owner.
 - `409 CONFLICT`: Proposal is stale (configuration changed since approval).
 - `422 VALIDATION_ERROR`: Proposal is not approved, or change type validation failed.
-- `500 INTERNAL_ERROR`: Application failed. Proposal status set to `failed` with error details.
+- `500 INTERNAL_ERROR`: Application failed. Proposal status is set to `failed`; database diagnostics remain server-side and are not returned.
 
 Allowlisted change types:
 - `workflow.update`: Updates `workflow.actions[0].delay_hours`. Validates workflow exists and belongs to CRM. Validates workflow has at least one action. Validates `workflow_id` is a valid UUID and `delay_hours` is a valid integer in range 0-8760. Increments CRM `configuration_version`. Captures old and new workflow state in audit log.
@@ -705,7 +705,7 @@ Application is atomic:
 5. Updates proposal status to `applied`.
 6. Logs application to audit_logs.
 
-If application fails, proposal status is set to `failed` with `application_error` populated. Manual intervention may be required.
+If application fails, proposal status is set to `failed` with `application_error` recorded for server-side diagnostics. Raw database errors are not returned by the API.
 
 ### 5.16 Reject a proposal
 

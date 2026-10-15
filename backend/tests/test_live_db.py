@@ -19,19 +19,34 @@ import uuid
 import pytest
 from typing import Any
 from supabase import create_client, Client
+from fastapi.testclient import TestClient
 
 from app.config import get_settings
 from app.database import CRMRepository
+from app.main import create_app
+
+api_client = TestClient(create_app())
 
 # Mark all tests in this file as live-database tests
+LIVE_TEST_ENV_VARS = (
+    "LIVE_TEST_USER_A_EMAIL",
+    "LIVE_TEST_USER_A_PASSWORD",
+    "LIVE_TEST_USER_B_EMAIL",
+    "LIVE_TEST_USER_B_PASSWORD",
+)
+LIVE_TEST_CONFIGURED = (
+    os.environ.get("RUN_LIVE_DB_TESTS") == "1"
+    and all(os.environ.get(name) for name in LIVE_TEST_ENV_VARS)
+)
 pytestmark = pytest.mark.skipif(
-    not os.environ.get("RUN_LIVE_DB_TESTS"),
-    reason="Live database tests require RUN_LIVE_DB_TESTS=1 and a configured development instance",
+    not LIVE_TEST_CONFIGURED,
+    reason="Live database tests require RUN_LIVE_DB_TESTS=1 and dedicated test-user credentials",
 )
 
-USER_A_EMAIL = "test_user_a_live@aura.dev"
-USER_B_EMAIL = "test_user_b_live@aura.dev"
-TEST_PASSWORD = "TestPassword123!"
+USER_A_EMAIL = os.environ.get("LIVE_TEST_USER_A_EMAIL", "")
+USER_B_EMAIL = os.environ.get("LIVE_TEST_USER_B_EMAIL", "")
+USER_A_PASSWORD = os.environ.get("LIVE_TEST_USER_A_PASSWORD", "")
+USER_B_PASSWORD = os.environ.get("LIVE_TEST_USER_B_PASSWORD", "")
 
 
 @pytest.fixture(scope="session")
@@ -50,7 +65,7 @@ def auth_context():
 
     # 1. Authenticate User A
     session_a = auth_client.auth.sign_in_with_password(
-        {"email": USER_A_EMAIL, "password": TEST_PASSWORD}
+        {"email": USER_A_EMAIL, "password": USER_A_PASSWORD}
     )
     assert session_a.session and session_a.session.access_token, "User A authentication failed"
     token_a = session_a.session.access_token
@@ -62,7 +77,7 @@ def auth_context():
 
     # 2. Authenticate User B
     session_b = auth_client.auth.sign_in_with_password(
-        {"email": USER_B_EMAIL, "password": TEST_PASSWORD}
+        {"email": USER_B_EMAIL, "password": USER_B_PASSWORD}
     )
     assert session_b.session and session_b.session.access_token, "User B authentication failed"
     token_b = session_b.session.access_token
@@ -75,8 +90,8 @@ def auth_context():
     assert user_a_id != user_b_id, "User A and User B must be distinct test accounts"
 
     return {
-        "user_a": {"id": user_a_id, "client": client_a, "repo": repo_a},
-        "user_b": {"id": user_b_id, "client": client_b, "repo": repo_b},
+        "user_a": {"id": user_a_id, "client": client_a, "repo": repo_a, "access_token": token_a},
+        "user_b": {"id": user_b_id, "client": client_b, "repo": repo_b, "access_token": token_b},
     }
 
 
@@ -261,14 +276,22 @@ def test_live_evolution_proposal_two_stage_lifecycle(auth_context):
         assert unauthorized_approval.get("error") == "not_owner"
 
         # 4. Stage 1: User A approves proposal via stored procedure
-        approved = repo_a.approve_proposal(prop_id, actor_id=user_a["id"])
-        assert approved is not None
+        approval_response = api_client.post(
+            f"/api/v1/crm/{crm_id}/evolution/proposals/{prop_id}/approve",
+            headers={"Authorization": f"Bearer {user_a['access_token']}"},
+        )
+        assert approval_response.status_code == 200, approval_response.text
+        approved = approval_response.json()["data"]
         assert approved["status"] == "approved"
         assert approved["approved_by"] == user_a["id"]
 
         # 5. Stage 2: User A applies proposal via atomic stored procedure
-        applied = repo_a.apply_proposal(prop_id, actor_id=user_a["id"])
-        assert applied is not None
+        response = api_client.post(
+            f"/api/v1/crm/{crm_id}/evolution/proposals/{prop_id}/apply",
+            headers={"Authorization": f"Bearer {user_a['access_token']}"},
+        )
+        assert response.status_code == 200, response.text
+        applied = response.json()["data"]
         assert applied["status"] == "applied"
         assert applied["applied_by"] == user_a["id"]
 
@@ -282,6 +305,232 @@ def test_live_evolution_proposal_two_stage_lifecycle(auth_context):
         assert updated_crm is not None
         assert updated_crm["configuration_version"] == initial_version + 1
 
+        # 8. Verify audit log entries were recorded for both stages
+        audit_approve = (
+            user_a["client"]
+            .table("audit_logs")
+            .select("*")
+            .eq("entity_id", prop_id)
+            .eq("action", "approve")
+            .execute()
+        )
+        assert len(audit_approve.data) >= 1
+        assert audit_approve.data[0]["action"] == "approve"
+        assert audit_approve.data[0]["entity_type"] == "evolution_proposal"
+
+        audit_apply = (
+            user_a["client"]
+            .table("audit_logs")
+            .select("*")
+            .eq("entity_id", prop_id)
+            .eq("action", "apply")
+            .execute()
+        )
+        assert len(audit_apply.data) >= 1
+        assert audit_apply.data[0]["action"] == "apply"
+        assert audit_apply.data[0]["entity_type"] == "evolution_proposal"
+
     finally:
         # Scoped cleanup
+        user_a["client"].table("crms").delete().eq("id", crm_id).execute()
+
+
+def test_live_evolution_proposal_workflow_create_lifecycle(auth_context):
+    """Test approval and atomic application of a workflow.create evolution proposal via database procedure."""
+    user_a = auth_context["user_a"]
+    user_b = auth_context["user_b"]
+    repo_a: CRMRepository = user_a["repo"]
+    repo_b: CRMRepository = user_b["repo"]
+
+    unique_suffix = uuid.uuid4().hex[:8]
+    crm = repo_a.create_crm(
+        owner_id=user_a["id"],
+        name=f"Workflow Create CRM {unique_suffix}",
+        configuration={"schema_version": "1.0", "name": "CRM", "industry": "tech", "entities": []},
+    )
+    crm_id = crm["id"]
+    initial_version = crm["configuration_version"]
+
+    try:
+        # 1. Create evolution proposal with type workflow.create
+        proposal = repo_a.create_proposal(
+            crm_id=crm_id,
+            summary="Add new follow-up workflow",
+            proposed_change={
+                "type": "workflow.create",
+                "name": f"Automated Lead Follow-up {unique_suffix}",
+                "trigger": {"type": "record.created", "entity": "lead"},
+                "actions": [{"type": "create_follow_up_task", "delay_hours": 24}],
+            },
+            evidence=[{"metric": "lead_response_time", "value": 24}],
+            config_version=initial_version,
+        )
+        prop_id = proposal["id"]
+        assert proposal["status"] == "pending"
+
+        # 2. Cross-tenant protection: User B CANNOT approve User A's proposal
+        unauthorized = repo_b.approve_proposal(prop_id, actor_id=user_b["id"])
+        assert unauthorized is not None
+        assert unauthorized.get("error") == "not_owner"
+
+        # 3. Stage 1: User A approves proposal via stored procedure
+        approval_response = api_client.post(
+            f"/api/v1/crm/{crm_id}/evolution/proposals/{prop_id}/approve",
+            headers={"Authorization": f"Bearer {user_a['access_token']}"},
+        )
+        assert approval_response.status_code == 200, approval_response.text
+        approved = approval_response.json()["data"]
+        assert approved["status"] == "approved"
+        assert approved["approved_by"] == user_a["id"]
+
+        # 4. Stage 2: User A applies proposal via atomic stored procedure
+        response = api_client.post(
+            f"/api/v1/crm/{crm_id}/evolution/proposals/{prop_id}/apply",
+            headers={"Authorization": f"Bearer {user_a['access_token']}"},
+        )
+        assert response.status_code == 200, response.text
+        applied = response.json()["data"]
+        assert applied["status"] == "applied"
+        assert applied["applied_by"] == user_a["id"]
+
+        # 5. Verify exactly one new workflow was created in draft status
+        workflows = repo_a.list_workflows(crm_id)
+        matching_wf = [w for w in workflows if w["name"] == f"Automated Lead Follow-up {unique_suffix}"]
+        assert len(matching_wf) == 1
+        new_wf = matching_wf[0]
+        assert new_wf["status"] == "draft"
+        assert new_wf["actions"][0]["delay_hours"] == 24
+
+        # 6. Verify CRM configuration version was monotonically incremented
+        updated_crm = repo_a.get_crm(crm_id, owner_id=user_a["id"])
+        assert updated_crm is not None
+        assert updated_crm["configuration_version"] == initial_version + 1
+
+        # 7. Verify audit log entry was recorded by the database procedure
+        audit_apply = (
+            user_a["client"]
+            .table("audit_logs")
+            .select("*")
+            .eq("entity_id", prop_id)
+            .eq("action", "apply")
+            .execute()
+        )
+        assert len(audit_apply.data) >= 1
+        assert audit_apply.data[0]["action"] == "apply"
+        assert audit_apply.data[0]["entity_type"] == "evolution_proposal"
+
+    finally:
+        # Scoped cleanup
+        user_a["client"].table("crms").delete().eq("id", crm_id).execute()
+
+def test_live_approved_stale_proposal_clears_approval_without_mutations(auth_context):
+    """A stale apply clears approval metadata without changing workflows or version again."""
+    user_a = auth_context["user_a"]
+    repo_a: CRMRepository = user_a["repo"]
+    suffix = uuid.uuid4().hex[:8]
+    crm = repo_a.create_crm(
+        owner_id=user_a["id"],
+        name=f"Stale Apply CRM {suffix}",
+        configuration={"schema_version": "1.0", "name": "CRM", "industry": "tech", "entities": []},
+    )
+    crm_id = crm["id"]
+    initial_version = crm["configuration_version"]
+    workflow = repo_a.create_workflow(
+        crm_id=crm_id,
+        name=f"Stale Workflow {suffix}",
+        trigger={"type": "record.created", "entity": "lead"},
+        actions=[{"type": "create_follow_up_task", "delay_hours": 48}],
+        status="draft",
+    )
+    proposal = repo_a.create_proposal(
+        crm_id=crm_id,
+        summary="Update a workflow that will become stale",
+        proposed_change={"type": "workflow.update", "workflow_id": workflow["id"], "delay_hours": 12},
+        evidence=[],
+        config_version=initial_version,
+    )
+    try:
+        approval = api_client.post(
+            f"/api/v1/crm/{crm_id}/evolution/proposals/{proposal['id']}/approve",
+            headers={"Authorization": f"Bearer {user_a['access_token']}"},
+        )
+        assert approval.status_code == 200, approval.text
+        user_a["client"].table("crms").update(
+            {"configuration_version": initial_version + 1}
+        ).eq("id", crm_id).execute()
+
+        response = api_client.post(
+            f"/api/v1/crm/{crm_id}/evolution/proposals/{proposal['id']}/apply",
+            headers={"Authorization": f"Bearer {user_a['access_token']}"},
+        )
+        assert response.status_code == 409, response.text
+        saved = repo_a.get_proposal(proposal["id"], crm_id)
+        assert saved["status"] == "stale"
+        assert saved["approved_at"] is None
+        assert saved["approved_by"] is None
+        saved_crm = repo_a.get_crm(crm_id, owner_id=user_a["id"])
+        assert saved_crm["configuration_version"] == initial_version + 1
+        saved_workflow = repo_a.get_workflow(workflow["id"], crm_id)
+        assert saved_workflow["actions"][0]["delay_hours"] == 48
+        apply_audit = user_a["client"].table("audit_logs").select("id").eq(
+            "entity_id", proposal["id"]
+        ).eq("action", "apply").execute()
+        assert not apply_audit.data
+    finally:
+        user_a["client"].table("crms").delete().eq("id", crm_id).execute()
+
+
+def test_live_failed_apply_rolls_back_and_clears_approval_metadata(auth_context):
+    """An integer overflow after workflow creation rolls the subtransaction back."""
+    user_a = auth_context["user_a"]
+    repo_a: CRMRepository = user_a["repo"]
+    suffix = uuid.uuid4().hex[:8]
+    crm = repo_a.create_crm(
+        owner_id=user_a["id"],
+        name=f"Failed Apply CRM {suffix}",
+        configuration={"schema_version": "1.0", "name": "CRM", "industry": "tech", "entities": []},
+    )
+    crm_id = crm["id"]
+    max_version = 2147483647
+    user_a["client"].table("crms").update(
+        {"configuration_version": max_version}
+    ).eq("id", crm_id).execute()
+    workflow_name = f"Rolled Back Workflow {suffix}"
+    proposal = repo_a.create_proposal(
+        crm_id=crm_id,
+        summary="Create a workflow that fails during version increment",
+        proposed_change={
+            "type": "workflow.create",
+            "name": workflow_name,
+            "trigger": {"type": "record.created", "entity": "lead"},
+            "actions": [{"type": "create_follow_up_task", "delay_hours": 24}],
+        },
+        evidence=[],
+        config_version=max_version,
+    )
+    try:
+        approval = api_client.post(
+            f"/api/v1/crm/{crm_id}/evolution/proposals/{proposal['id']}/approve",
+            headers={"Authorization": f"Bearer {user_a['access_token']}"},
+        )
+        assert approval.status_code == 200, approval.text
+        response = api_client.post(
+            f"/api/v1/crm/{crm_id}/evolution/proposals/{proposal['id']}/apply",
+            headers={"Authorization": f"Bearer {user_a['access_token']}"},
+        )
+        assert response.status_code == 500, response.text
+        saved = repo_a.get_proposal(proposal["id"], crm_id)
+        assert saved["status"] == "failed"
+        assert saved["approved_at"] is None
+        assert saved["approved_by"] is None
+        assert saved["application_error"]
+        saved_crm = repo_a.get_crm(crm_id, owner_id=user_a["id"])
+        assert saved_crm["configuration_version"] == max_version
+        workflows = repo_a.list_workflows(crm_id)
+        assert all(w["name"] != workflow_name for w in workflows)
+        apply_audit = user_a["client"].table("audit_logs").select("id").eq(
+            "entity_id", proposal["id"]
+        ).eq("action", "apply").execute()
+        assert not apply_audit.data
+    finally:
         user_a["client"].table("crms").delete().eq("id", crm_id).execute()

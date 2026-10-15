@@ -14,11 +14,11 @@ from __future__ import annotations
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 
 from app.auth import CurrentUser
 from app.config import get_settings, Settings
-from app.database import CRMRepository
+from app.database import CRMRepository, get_user_scoped_client
 from app.routers.responses import success_response, error_response
 from app.schemas.crm import (
     ApproveProposalRequest,
@@ -34,7 +34,9 @@ from app.services.ai_provider import get_ai_provider
 router = APIRouter(prefix="/crm/{crm_id}/evolution", tags=["Evolution"])
 
 
-def _get_repo() -> CRMRepository:
+def _get_repo(access_token: str | None = None) -> CRMRepository:
+    if access_token:
+        return CRMRepository(client=get_user_scoped_client(access_token))
     return CRMRepository()
 
 
@@ -53,7 +55,6 @@ def _proposal_to_dict(p: dict) -> dict:
         "rejected_at": p.get("rejected_at"),
         "rejected_by": p.get("rejected_by"),
         "rejection_reason": p.get("rejection_reason"),
-        "application_error": p.get("application_error"),
     }
 
 
@@ -123,11 +124,14 @@ async def list_proposals(crm_id: UUID, user_id: CurrentUser):
 async def approve_proposal(
     crm_id: UUID,
     proposal_id: UUID,
+    request: Request,
     user_id: CurrentUser,
     body: ApproveProposalRequest | None = None,
 ):
     """Approve a pending proposal. Does NOT apply it."""
-    repo = _get_repo()
+    authorization = request.headers.get("Authorization", "")
+    access_token = authorization[7:] if authorization.startswith("Bearer ") else ""
+    repo = _get_repo(access_token)
     crm = repo.get_crm(str(crm_id), user_id)
     if not crm:
         return error_response(404, "NOT_FOUND", "CRM not found.")
@@ -157,6 +161,19 @@ async def approve_proposal(
     result = repo.approve_proposal(str(proposal_id), user_id)
     if not result:
         return error_response(422, "VALIDATION_ERROR", "Could not approve proposal.")
+    if "error" in result:
+        err = result["error"]
+        if err in ("not_found", "not_owner"):
+            return error_response(404, "NOT_FOUND", "Proposal not found.")
+        elif err == "crm_archived":
+            return error_response(403, "FORBIDDEN", "CRM is archived.")
+        elif err in ("stale", "version_mismatch"):
+            return error_response(409, "CONFLICT", "CRM configuration has changed since proposal creation.")
+        elif err == "not_pending":
+            return error_response(422, "VALIDATION_ERROR", "Proposal is not pending.")
+        elif err == "invalid_change_type":
+            return error_response(422, "VALIDATION_ERROR", "Proposed change type not allowlisted.")
+        return error_response(422, "VALIDATION_ERROR", f"Could not approve proposal: {err}")
 
     return success_response(_proposal_to_dict(result))
 
@@ -165,10 +182,13 @@ async def approve_proposal(
 async def apply_proposal(
     crm_id: UUID,
     proposal_id: UUID,
+    request: Request,
     user_id: CurrentUser,
 ):
-    """Apply an approved proposal atomically."""
-    repo = _get_repo()
+    """Apply an approved proposal atomically through the database function."""
+    authorization = request.headers.get("Authorization", "")
+    access_token = authorization[7:] if authorization.startswith("Bearer ") else ""
+    repo = _get_repo(access_token)
     crm = repo.get_crm(str(crm_id), user_id)
     if not crm:
         return error_response(404, "NOT_FOUND", "CRM not found.")
@@ -181,91 +201,34 @@ async def apply_proposal(
     if proposal["status"] != "approved":
         return error_response(422, "VALIDATION_ERROR", f"Proposal is '{proposal['status']}', not approved.")
 
-    # Staleness re-check
-    if proposal["configuration_version_at_creation"] != crm["configuration_version"]:
-        return error_response(409, "CONFLICT", "Configuration has changed since proposal creation.")
-
-    change = proposal["proposed_change"]
-    change_type = change.get("type")
-
+    # The database function is authoritative for validation, staleness, and
+    # every mutation. The route only checks access and translates its result.
     try:
-        if change_type == "workflow.update":
-            # Validate change fields
-            wf_id = change.get("workflow_id")
-            delay = change.get("delay_hours")
-            if not wf_id or delay is None:
-                repo.fail_proposal(str(proposal_id), "Missing workflow_id or delay_hours")
-                return error_response(422, "VALIDATION_ERROR", "Invalid change: missing required fields.")
-
-            # Fetch workflow
-            workflow = repo.get_workflow(wf_id, str(crm_id))
-            if not workflow:
-                repo.fail_proposal(str(proposal_id), "Workflow not found")
-                return error_response(422, "VALIDATION_ERROR", "Target workflow not found or not in CRM.")
-
-            # Update the first action's delay_hours
-            actions = workflow.get("actions", [])
-            if not actions:
-                repo.fail_proposal(str(proposal_id), "Workflow has no actions")
-                return error_response(422, "VALIDATION_ERROR", "Workflow has no actions to update.")
-
-            old_actions = list(actions)
-            actions[0]["delay_hours"] = delay
-
-            # Apply: update workflow, increment version, mark applied, audit
-            repo.update_workflow_actions(wf_id, str(crm_id), actions)
-            repo.increment_config_version(str(crm_id), user_id)
-            result = repo.apply_proposal(str(proposal_id), user_id)
-            repo.insert_audit_log(
-                crm_id=str(crm_id),
-                user_id=user_id,
-                action="apply",
-                entity_type="evolution_proposal",
-                entity_id=str(proposal_id),
-                old_values={"actions": old_actions},
-                new_values={"actions": actions, "delay_hours": delay},
-            )
-
-        elif change_type == "workflow.create":
-            name = change.get("name", "")
-            trigger = change.get("trigger", {})
-            actions = change.get("actions", [{"type": "create_follow_up_task", "delay_hours": 24}])
-
-            if not name:
-                repo.fail_proposal(str(proposal_id), "Missing workflow name")
-                return error_response(422, "VALIDATION_ERROR", "Missing workflow name.")
-
-            # Create workflow as draft
-            wf = repo.create_workflow(
-                crm_id=str(crm_id),
-                name=name,
-                trigger=trigger,
-                actions=actions,
-                status="draft",
-            )
-            repo.increment_config_version(str(crm_id), user_id)
-            result = repo.apply_proposal(str(proposal_id), user_id)
-            repo.insert_audit_log(
-                crm_id=str(crm_id),
-                user_id=user_id,
-                action="apply",
-                entity_type="evolution_proposal",
-                entity_id=str(proposal_id),
-                new_values={"workflow_id": wf["id"], "name": name},
-            )
-
-        else:
-            repo.fail_proposal(str(proposal_id), f"Unsupported change type: {change_type}")
-            return error_response(422, "VALIDATION_ERROR", "Unsupported change type.")
+        result = repo.apply_proposal(str(proposal_id))
 
         if not result:
+            return error_response(500, "INTERNAL_ERROR", "Failed to apply proposal.")
+        if "error" in result:
+            err = result["error"]
+            if err in ("not_found", "not_owner", "crm_not_found"):
+                return error_response(404, "NOT_FOUND", "Proposal or CRM not found.")
+            elif err == "crm_archived":
+                return error_response(403, "FORBIDDEN", "CRM is archived.")
+            elif err == "not_approved":
+                return error_response(422, "VALIDATION_ERROR", "Proposal is not approved.")
+            elif err == "stale":
+                return error_response(409, "CONFLICT", "Configuration has changed since proposal creation.")
+            elif err.startswith("invalid_change"):
+                return error_response(422, "VALIDATION_ERROR", err)
+            elif err == "apply_failed":
+                return error_response(500, "INTERNAL_ERROR", "Proposal application failed.")
             return error_response(500, "INTERNAL_ERROR", "Failed to apply proposal.")
 
         return success_response(_proposal_to_dict(result))
 
-    except Exception as exc:
-        # Mark as failed
-        repo.fail_proposal(str(proposal_id), str(exc)[:500])
+    except Exception:
+        # The database function owns failure status and rollback. Avoid a
+        # second mutation here if the RPC outcome is uncertain.
         return error_response(500, "INTERNAL_ERROR", "Proposal application failed.")
 
 

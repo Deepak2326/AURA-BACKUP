@@ -30,6 +30,14 @@ def get_supabase_client() -> Client:
     return _client
 
 
+def get_user_scoped_client(access_token: str) -> Client:
+    """Create a Supabase client whose requests carry the authenticated user's JWT."""
+    settings = get_settings()
+    client = create_client(settings.supabase_url, settings.supabase_anon_key)
+    client.postgrest.auth(access_token)
+    return client
+
+
 class CRMRepository:
     """Data access for CRM operations. All methods enforce ownership."""
 
@@ -356,61 +364,35 @@ class CRMRepository:
     def approve_proposal(
         self, proposal_id: str, actor_id: str, expected_version: int | None = None
     ) -> dict[str, Any] | None:
-        """Approve a proposal (pending -> approved) via stored procedure or direct update."""
-        try:
-            params: dict[str, Any] = {"proposal_uuid": proposal_id}
-            if expected_version is not None:
-                params["expected_version"] = expected_version
-            rpc_res = self._client.rpc("approve_evolution_proposal", params).execute()
-            if rpc_res.data == "approved":
-                res = self._client.table("evolution_proposals").select("*").eq("id", proposal_id).execute()
-                return res.data[0] if res.data else None
-            elif rpc_res.data:
-                return {"status": rpc_res.data, "error": rpc_res.data}
-        except Exception:
-            pass
+        """Approve a proposal through the authenticated database function.
 
-        from datetime import datetime, timezone
+        actor_id remains for call-site compatibility; PostgreSQL derives the
+        authorization identity from auth.uid().
+        """
+        params: dict[str, Any] = {"proposal_uuid": proposal_id}
+        if expected_version is not None:
+            params["expected_version"] = expected_version
+        rpc_res = self._client.rpc("approve_evolution_proposal", params).execute()
+        if rpc_res.data == "approved":
+            res = self._client.table("evolution_proposals").select("*").eq("id", proposal_id).execute()
+            return res.data[0] if res.data else None
+        if rpc_res.data:
+            return {"status": rpc_res.data, "error": rpc_res.data}
+        return None
 
-        result = (
-            self._client.table("evolution_proposals")
-            .update({
-                "status": "approved",
-                "approved_at": datetime.now(timezone.utc).isoformat(),
-                "approved_by": actor_id,
-            })
-            .eq("id", proposal_id)
-            .eq("status", "pending")
-            .execute()
-        )
-        return result.data[0] if result.data else None
-
-    def apply_proposal(self, proposal_id: str, actor_id: str) -> dict[str, Any] | None:
-        """Apply an approved proposal (approved -> applied) via atomic stored procedure."""
+    def apply_proposal(self, proposal_id: str) -> dict[str, Any] | None:
+        """Apply a proposal only through the atomic database function."""
         try:
             rpc_res = self._client.rpc("apply_evolution_proposal", {"proposal_uuid": proposal_id}).execute()
-            if rpc_res.data == "applied":
-                res = self._client.table("evolution_proposals").select("*").eq("id", proposal_id).execute()
-                return res.data[0] if res.data else None
-            elif rpc_res.data:
-                return {"status": rpc_res.data, "error": rpc_res.data}
-        except Exception:
-            pass
+        except Exception as exc:
+            raise RuntimeError("Failed to apply evolution proposal through database function") from exc
 
-        from datetime import datetime, timezone
-
-        result = (
-            self._client.table("evolution_proposals")
-            .update({
-                "status": "applied",
-                "applied_at": datetime.now(timezone.utc).isoformat(),
-                "applied_by": actor_id,
-            })
-            .eq("id", proposal_id)
-            .eq("status", "approved")
-            .execute()
-        )
-        return result.data[0] if result.data else None
+        if rpc_res.data == "applied":
+            res = self._client.table("evolution_proposals").select("*").eq("id", proposal_id).execute()
+            return res.data[0] if res.data else None
+        if rpc_res.data:
+            return {"status": rpc_res.data, "error": rpc_res.data}
+        return None
 
     def reject_proposal(
         self, proposal_id: str, actor_id: str, reason: str
