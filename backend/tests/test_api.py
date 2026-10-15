@@ -96,3 +96,13 @@ def test_validation_service():
     _, errors = validate_record_data(entity, {"email": "a@b.com", "stage": "new", "unknown_field": "val"})
     assert len(errors) == 1
     assert errors[0]["field"] == "unknown_field"
+
+def test_workflow_trigger_contract_uses_type_field():
+    from pathlib import Path
+    from pydantic import ValidationError
+    from app.schemas.crm import WorkflowTrigger
+    contract = (Path(__file__).resolve().parents[2] / "docs" / "API_CONTRACTS.md").read_text(encoding="utf-8")
+    assert '"trigger": {"type": "record.created", "entity": "lead"}' in contract
+    assert WorkflowTrigger(type="record.created", entity="lead").type == "record.created"
+    with pytest.raises(ValidationError):
+        WorkflowTrigger(event="record.created", entity="lead")
