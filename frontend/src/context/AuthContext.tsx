@@ -11,6 +11,7 @@ interface AuthContextType {
   isMockMode: boolean;
   signIn: (email: string, password: string) => Promise<{ error?: string }>;
   signUp: (email: string, password: string) => Promise<{ error?: string; message?: string }>;
+  signInWithOAuth: (provider: 'google' | 'github') => Promise<{ error?: string }>;
   signOut: () => Promise<void>;
   resetPassword: (email: string) => Promise<{ error?: string; message?: string }>;
   loginAsDemoUser: () => void;
@@ -139,6 +140,48 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return { message: 'Password reset link sent to your email.' };
   };
 
+  const signInWithOAuth = async (provider: 'google' | 'github'): Promise<{ error?: string }> => {
+    if (!isSupabaseConfigured) {
+      return { error: 'Supabase authentication is not configured in environment.' };
+    }
+    try {
+      const callbackUrl = `${window.location.origin}/auth/callback`;
+      const { data, error } = await supabase.auth.signInWithOAuth({
+        provider,
+        options: {
+          redirectTo: callbackUrl,
+        },
+      });
+
+      if (error) {
+        return { error: error.message };
+      }
+
+      if (data?.url) {
+        // Pre-flight check to verify if the provider is enabled before leaving SPA
+        try {
+          const probe = await fetch(data.url, { method: 'GET' });
+          if (probe.status === 400) {
+            const body = await probe.json().catch(() => null);
+            const msg = body?.msg || body?.message || 'Unsupported provider: provider is not enabled';
+            return {
+              error: `${provider === 'google' ? 'Google' : 'GitHub'} OAuth not configured: ${msg}. Provider credentials must be enabled in the Supabase Dashboard.`,
+            };
+          }
+        } catch {
+          // If cross-origin redirect throws, provider is active and redirecting
+        }
+
+        window.location.href = data.url;
+        return {};
+      }
+
+      return { error: 'Failed to generate OAuth authorization URL.' };
+    } catch (err: any) {
+      return { error: err.message || 'OAuth sign-in failed.' };
+    }
+  };
+
   const loginAsDemoUser = () => {
     localStorage.setItem('aura_demo_session', 'true');
     setUseMockMode(true);
@@ -161,6 +204,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         isMockMode,
         signIn,
         signUp,
+        signInWithOAuth,
         signOut,
         resetPassword,
         loginAsDemoUser,

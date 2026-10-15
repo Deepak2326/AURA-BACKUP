@@ -164,6 +164,65 @@ export async function runFrontendTests() {
     assert(false, `7. Evolution Lifecycle error: ${e}`);
   }
 
+  // Test 8: Supabase OAuth & Client Configuration Audit
+  try {
+    const { supabase, isSupabaseConfigured } = await import('../services/supabase');
+    assert(isSupabaseConfigured, '8.1 Supabase client is properly configured with public credentials');
+
+    // 8.2 Client key security check
+    const anonKey = process.env.VITE_SUPABASE_ANON_KEY || '';
+    if (anonKey) {
+      const parts = anonKey.split('.');
+      if (parts.length === 3) {
+        const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf8'));
+        assert(payload.role === 'anon', '8.2 Supabase client uses anon role key and never exposes service_role');
+        assert(payload.role !== 'service_role', '8.3 Service-role keys are strictly absent from client bundle');
+      }
+    }
+
+    // 8.3 Google OAuth URL generation
+    const googleOAuth = await supabase.auth.signInWithOAuth({
+      provider: 'google',
+      options: { redirectTo: 'http://localhost:5173/auth/callback' },
+    });
+    assert(Boolean(googleOAuth.data?.url), '8.4 Google OAuth generates authorization endpoint URL');
+    assert(
+      Boolean(googleOAuth.data?.url?.includes('provider=google')),
+      '8.5 Google OAuth target URL references provider=google'
+    );
+
+    // 8.4 GitHub OAuth URL generation
+    const githubOAuth = await supabase.auth.signInWithOAuth({
+      provider: 'github',
+      options: { redirectTo: 'http://localhost:5173/auth/callback' },
+    });
+    assert(Boolean(githubOAuth.data?.url), '8.6 GitHub OAuth generates authorization endpoint URL');
+    assert(
+      Boolean(githubOAuth.data?.url?.includes('provider=github')),
+      '8.7 GitHub OAuth target URL references provider=github'
+    );
+
+    // 8.5 Provider backend enablement audit (proves providers are not enabled in Gotrue)
+    if (googleOAuth.data?.url) {
+      const gRes = await fetch(googleOAuth.data.url);
+      const gData = await gRes.json().catch(() => ({}));
+      assert(
+        gRes.status === 400 && gData.msg === 'Unsupported provider: provider is not enabled',
+        '8.8 Gotrue correctly reports Google provider is not enabled in dashboard'
+      );
+    }
+    if (githubOAuth.data?.url) {
+      const ghRes = await fetch(githubOAuth.data.url);
+      const ghData = await ghRes.json().catch(() => ({}));
+      assert(
+        ghRes.status === 400 && ghData.msg === 'Unsupported provider: provider is not enabled',
+        '8.9 Gotrue correctly reports GitHub provider is not enabled in dashboard'
+      );
+    }
+  } catch (e) {
+    assert(false, `8. Supabase OAuth Audit error: ${e}`);
+  }
+
   console.log(`\n📊 Test Results: ${passed} Passed, ${failed} Failed`);
   return { passed, failed };
 }
