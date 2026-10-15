@@ -27,3 +27,6 @@ Thumbs.db
 # Test / coverage
 .coverage
 htmlcov/
+
+# Supabase
+supabase/.temp/

@@ -172,7 +172,7 @@ class UpdateRecordRequest(StrictModel):
 
 
 class CRMRecord(StrictModel):
-    record_id: UUID
+    id: UUID
     crm_id: UUID
     entity_name: str
     data: dict[str, Any]
@@ -195,18 +195,28 @@ class ImportRowError(StrictModel):
 
 
 class ImportResult(StrictModel):
-    imported: int = Field(ge=0)
+    created: int = Field(ge=0)
     skipped: int = Field(ge=0)
     errors: list[ImportRowError] = Field(default_factory=list)
 
 
-WorkflowEvent = Literal["record.created", "record.updated"]
-WorkflowActionType = Literal["create_follow_up_task", "notify_owner"]
+# Allowlisted trigger types for workflow automation
+WorkflowTriggerType = Literal["record.created", "record.updated", "record.stage_changed"]
+
+# Allowlisted action types for workflow automation
+WorkflowActionType = Literal["create_follow_up_task", "notify_owner", "send_email"]
 
 
 class WorkflowTrigger(StrictModel):
-    event: WorkflowEvent
-    entity: str
+    type: WorkflowTriggerType
+    entity: str = Field(min_length=1, max_length=64)
+
+    @field_validator("entity")
+    @classmethod
+    def valid_entity_name(cls, value: str) -> str:
+        if not IDENTIFIER.fullmatch(value):
+            raise ValueError("Entity name must be a lowercase identifier.")
+        return value
 
 
 class WorkflowAction(StrictModel):
@@ -249,21 +259,54 @@ class EvolutionObjectiveRequest(StrictModel):
 
 
 class ProposedChange(StrictModel):
+    """Evolution proposal change payload. Structure depends on type.
+
+    workflow.update: workflow_id (required), delay_hours (required)
+    workflow.create: name (required), trigger (required), actions (optional)
+    """
     type: Literal["workflow.update", "workflow.create"]
+    # workflow.update fields
     workflow_id: UUID | None = None
     delay_hours: int | None = Field(default=None, ge=0, le=8760)
+    # workflow.create fields
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    trigger: WorkflowTrigger | None = None
+    actions: list[WorkflowAction] | None = Field(default=None, min_length=1, max_length=10)
+
+    @model_validator(mode="after")
+    def validate_change_fields(self) -> "ProposedChange":
+        if self.type == "workflow.update":
+            if self.workflow_id is None:
+                raise ValueError("workflow.update requires workflow_id")
+            if self.delay_hours is None:
+                raise ValueError("workflow.update requires delay_hours")
+        elif self.type == "workflow.create":
+            if self.name is None:
+                raise ValueError("workflow.create requires name")
+            if self.trigger is None:
+                raise ValueError("workflow.create requires trigger")
+        return self
 
 
 class EvolutionProposalData(StrictModel):
     proposal_id: UUID
-    status: Literal["pending", "approved", "applied", "rejected", "stale"]
+    status: Literal["pending", "approved", "applied", "rejected", "stale", "failed"]
     summary: str
     proposed_change: ProposedChange
     evidence: list[dict[str, Any]] = Field(default_factory=list)
+    approved_at: datetime | None = None
+    approved_by: UUID | None = None
+    applied_at: datetime | None = None
+    applied_by: UUID | None = None
+    rejected_at: datetime | None = None
+    rejected_by: UUID | None = None
+    rejection_reason: str | None = None
+    application_error: str | None = None
 
 
 class ApproveProposalRequest(StrictModel):
     expected_status: Literal["pending"] = "pending"
+    expected_version: int | None = Field(default=None, ge=1)
 
 
 class RejectProposalRequest(StrictModel):
