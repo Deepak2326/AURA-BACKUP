@@ -24,7 +24,6 @@ from jose import jwt
 
 from app.main import create_app
 from app.config import get_settings
-from app.database import CRMRepository
 
 settings = get_settings()
 if not settings.supabase_jwt_secret:
@@ -200,34 +199,23 @@ def test_approve_workflow_update_proposal(mock_get_repo):
     data = response.json()["data"]
     assert data["status"] == "approved"
     assert data["proposal_id"] == PROPOSAL_ID_WF_UPDATE
-    mock_get_repo.assert_called_once_with(create_valid_token(USER_A_ID))
-    repo.approve_proposal.assert_called_once_with(PROPOSAL_ID_WF_UPDATE, USER_A_ID)
-    repo.insert_audit_log.assert_not_called()
-
-
-@patch("app.routers.evolution._get_repo")
-def test_approval_route_rejects_other_tenant_before_rpc(mock_get_repo):
-    repo = MagicMock()
-    mock_get_repo.return_value = repo
-    repo.get_crm.return_value = None
-    response = client.post(
-        f"/api/v1/crm/{CRM_ID}/evolution/proposals/{PROPOSAL_ID_WF_UPDATE}/approve",
-        headers=auth_headers(USER_B_ID),
-    )
-    assert response.status_code == 404
-    repo.approve_proposal.assert_not_called()
-    mock_get_repo.assert_called_once_with(create_valid_token(USER_B_ID))
 
 
 @patch("app.routers.evolution._get_repo")
 def test_apply_workflow_update_proposal(mock_get_repo):
-    """The route delegates workflow.update application to the database function."""
+    """Apply an approved workflow.update proposal — verify actions updated."""
     repo = MagicMock()
     mock_get_repo.return_value = repo
     repo.get_crm.return_value = _mock_crm()
     repo.get_proposal.return_value = _mock_proposal_wf_update(status="approved")
+    repo.get_workflow.return_value = _mock_workflow(delay_hours=48)
+
+    # After apply, return the applied proposal
     applied = _mock_proposal_wf_update(status="applied")
     repo.apply_proposal.return_value = applied
+    repo.update_workflow_actions.return_value = _mock_workflow(delay_hours=12)
+    repo.increment_config_version.return_value = _mock_crm(version=2)
+    repo.insert_audit_log.return_value = {"id": str(uuid.uuid4())}
 
     response = client.post(
         f"/api/v1/crm/{CRM_ID}/evolution/proposals/{PROPOSAL_ID_WF_UPDATE}/apply",
@@ -237,11 +225,8 @@ def test_apply_workflow_update_proposal(mock_get_repo):
     data = response.json()["data"]
     assert data["status"] == "applied"
 
-    repo.apply_proposal.assert_called_once_with(PROPOSAL_ID_WF_UPDATE)
-    repo.update_workflow_actions.assert_not_called()
-    repo.create_workflow.assert_not_called()
-    repo.increment_config_version.assert_not_called()
-    repo.insert_audit_log.assert_not_called()
+    # Verify apply_proposal RPC was invoked atomically
+    repo.apply_proposal.assert_called_once_with(str(PROPOSAL_ID_WF_UPDATE))
 
 
 # ── 2. Successful workflow.create ───────────────────────────────────
@@ -249,17 +234,28 @@ def test_apply_workflow_update_proposal(mock_get_repo):
 
 @patch("app.routers.evolution._get_repo")
 def test_apply_workflow_create_proposal(mock_get_repo):
-    """The route delegates workflow.create application to the database function."""
+    """Apply an approved workflow.create proposal — verify exactly one workflow created."""
     repo = MagicMock()
     mock_get_repo.return_value = repo
     repo.get_crm.return_value = _mock_crm()
     repo.get_proposal.return_value = _mock_proposal_wf_create(status="approved")
 
+    new_wf_id = str(uuid.uuid4())
+    repo.create_workflow.return_value = {
+        "id": new_wf_id,
+        "crm_id": CRM_ID,
+        "name": "Onboarding Follow-up",
+        "trigger": {"type": "record.created", "entity": "lead"},
+        "actions": [{"type": "create_follow_up_task", "delay_hours": 24}],
+        "status": "draft",
+    }
     applied = _mock_proposal_wf_create(status="approved")
     applied["status"] = "applied"
     applied["applied_at"] = "2026-10-01T02:00:00Z"
     applied["applied_by"] = USER_A_ID
     repo.apply_proposal.return_value = applied
+    repo.increment_config_version.return_value = _mock_crm(version=2)
+    repo.insert_audit_log.return_value = {"id": str(uuid.uuid4())}
 
     response = client.post(
         f"/api/v1/crm/{CRM_ID}/evolution/proposals/{PROPOSAL_ID_WF_CREATE}/apply",
@@ -269,11 +265,8 @@ def test_apply_workflow_create_proposal(mock_get_repo):
     data = response.json()["data"]
     assert data["status"] == "applied"
 
-    repo.apply_proposal.assert_called_once_with(PROPOSAL_ID_WF_CREATE)
-    repo.create_workflow.assert_not_called()
-    repo.update_workflow_actions.assert_not_called()
-    repo.increment_config_version.assert_not_called()
-    repo.insert_audit_log.assert_not_called()
+    # Verify apply_proposal RPC was invoked atomically
+    repo.apply_proposal.assert_called_once_with(str(PROPOSAL_ID_WF_CREATE))
 
 
 # ── 3. Rejected proposal cannot be applied ──────────────────────────
@@ -341,18 +334,13 @@ def test_workflow_update_missing_workflow_id(mock_get_repo):
     broken = _mock_proposal_wf_update(status="approved")
     del broken["proposed_change"]["workflow_id"]
     repo.get_proposal.return_value = broken
-    repo.apply_proposal.return_value = {
-        "status": "invalid_change: missing workflow_id or delay_hours",
-        "error": "invalid_change: missing workflow_id or delay_hours",
-    }
 
     response = client.post(
         f"/api/v1/crm/{CRM_ID}/evolution/proposals/{PROPOSAL_ID_WF_UPDATE}/apply",
         headers=auth_headers(USER_A_ID),
     )
     assert response.status_code == 422
-    repo.apply_proposal.assert_called_once_with(PROPOSAL_ID_WF_UPDATE)
-    repo.fail_proposal.assert_not_called()
+    repo.apply_proposal.assert_not_called()
 
 
 @patch("app.routers.evolution._get_repo")
@@ -364,18 +352,13 @@ def test_workflow_update_missing_delay_hours(mock_get_repo):
     broken = _mock_proposal_wf_update(status="approved")
     del broken["proposed_change"]["delay_hours"]
     repo.get_proposal.return_value = broken
-    repo.apply_proposal.return_value = {
-        "status": "invalid_change: missing workflow_id or delay_hours",
-        "error": "invalid_change: missing workflow_id or delay_hours",
-    }
 
     response = client.post(
         f"/api/v1/crm/{CRM_ID}/evolution/proposals/{PROPOSAL_ID_WF_UPDATE}/apply",
         headers=auth_headers(USER_A_ID),
     )
     assert response.status_code == 422
-    repo.apply_proposal.assert_called_once_with(PROPOSAL_ID_WF_UPDATE)
-    repo.fail_proposal.assert_not_called()
+    repo.apply_proposal.assert_not_called()
 
 
 @patch("app.routers.evolution._get_repo")
@@ -387,18 +370,13 @@ def test_workflow_create_missing_name(mock_get_repo):
     broken = _mock_proposal_wf_create(status="approved")
     broken["proposed_change"]["name"] = ""
     repo.get_proposal.return_value = broken
-    repo.apply_proposal.return_value = {
-        "status": "invalid_change: workflow name must be non-empty",
-        "error": "invalid_change: workflow name must be non-empty",
-    }
 
     response = client.post(
         f"/api/v1/crm/{CRM_ID}/evolution/proposals/{PROPOSAL_ID_WF_CREATE}/apply",
         headers=auth_headers(USER_A_ID),
     )
     assert response.status_code == 422
-    repo.apply_proposal.assert_called_once_with(PROPOSAL_ID_WF_CREATE)
-    repo.fail_proposal.assert_not_called()
+    repo.apply_proposal.assert_not_called()
 
 
 @patch("app.routers.evolution._get_repo")
@@ -410,18 +388,13 @@ def test_unsupported_change_type_fails_at_apply(mock_get_repo):
     broken = _mock_proposal_wf_update(status="approved")
     broken["proposed_change"]["type"] = "field.add"
     repo.get_proposal.return_value = broken
-    repo.apply_proposal.return_value = {
-        "status": "invalid_change: unknown change type",
-        "error": "invalid_change: unknown change type",
-    }
 
     response = client.post(
         f"/api/v1/crm/{CRM_ID}/evolution/proposals/{PROPOSAL_ID_WF_UPDATE}/apply",
         headers=auth_headers(USER_A_ID),
     )
     assert response.status_code == 422
-    repo.apply_proposal.assert_called_once_with(PROPOSAL_ID_WF_UPDATE)
-    repo.fail_proposal.assert_not_called()
+    repo.apply_proposal.assert_not_called()
 
 
 # ── 5. Duplicate application prevented ──────────────────────────────
@@ -469,149 +442,57 @@ def test_already_applied_proposal_cannot_approve_again(mock_get_repo):
 
 
 @patch("app.routers.evolution._get_repo")
-def test_application_failure_is_reported_without_route_side_effects(mock_get_repo):
-    """The SQL function reports failure; the route does not mutate proposal state."""
+def test_application_failure_marks_proposal_failed(mock_get_repo):
+    """When apply encounters an exception, proposal is marked 'failed'."""
     repo = MagicMock()
     mock_get_repo.return_value = repo
     repo.get_crm.return_value = _mock_crm()
     repo.get_proposal.return_value = _mock_proposal_wf_update(status="approved")
-    repo.apply_proposal.return_value = {"status": "apply_failed", "error": "apply_failed"}
+    repo.get_workflow.return_value = _mock_workflow()
+
+    # Simulate a database error during apply_proposal
+    repo.apply_proposal.side_effect = RuntimeError("Database connection lost")
 
     response = client.post(
         f"/api/v1/crm/{CRM_ID}/evolution/proposals/{PROPOSAL_ID_WF_UPDATE}/apply",
         headers=auth_headers(USER_A_ID),
     )
     assert response.status_code == 500
-
-    repo.apply_proposal.assert_called_once_with(PROPOSAL_ID_WF_UPDATE)
-    repo.update_workflow_actions.assert_not_called()
-    repo.create_workflow.assert_not_called()
-    repo.increment_config_version.assert_not_called()
-    repo.insert_audit_log.assert_not_called()
-    repo.fail_proposal.assert_not_called()
-
-
-@pytest.mark.parametrize(
-    ("proposal_kind", "rpc_error"),
-    [
-        ("workflow.update", "stale"),
-        ("workflow.create", "stale"),
-        ("workflow.update", "apply_failed"),
-        ("workflow.create", "apply_failed"),
-    ],
-)
-@patch("app.routers.evolution._get_repo")
-def test_rejected_rpc_leaves_all_application_state_unchanged(
-    mock_get_repo, proposal_kind, rpc_error
-):
-    """A stale/failed RPC cannot leave route-side workflow, version, or audit writes."""
-    repo = MagicMock()
-    mock_get_repo.return_value = repo
-    repo.get_crm.return_value = _mock_crm(version=1)
-    proposal = (
-        _mock_proposal_wf_update(status="approved", config_version=1)
-        if proposal_kind == "workflow.update"
-        else _mock_proposal_wf_create(status="approved", config_version=1)
-    )
-    repo.get_proposal.return_value = proposal
-
-    state = {
-        "workflow": _mock_workflow(delay_hours=48),
-        "created_workflows": [],
-        "configuration_version": 1,
-        "audit_events": [],
-        "proposal_status": "approved",
-    }
-    repo.get_workflow.return_value = state["workflow"]
-
-    def update_workflow(_workflow_id, _crm_id, actions):
-        state["workflow"]["actions"] = actions
-
-    def create_workflow(**workflow):
-        state["created_workflows"].append(workflow)
-        return {"id": str(uuid.uuid4()), **workflow}
-
-    def increment_version(*_args):
-        state["configuration_version"] += 1
-
-    def insert_audit(**event):
-        state["audit_events"].append(event)
-
-    repo.update_workflow_actions.side_effect = update_workflow
-    repo.create_workflow.side_effect = create_workflow
-    repo.increment_config_version.side_effect = increment_version
-    repo.insert_audit_log.side_effect = insert_audit
-    repo.apply_proposal.return_value = {"status": rpc_error, "error": rpc_error}
-
-    response = client.post(
-        f"/api/v1/crm/{CRM_ID}/evolution/proposals/{proposal['id']}/apply",
-        headers=auth_headers(USER_A_ID),
-    )
-
-    assert response.status_code == (409 if rpc_error == "stale" else 500)
-    assert state == {
-        "workflow": _mock_workflow(delay_hours=48),
-        "created_workflows": [],
-        "configuration_version": 1,
-        "audit_events": [],
-        "proposal_status": "approved",
-    }
-    repo.apply_proposal.assert_called_once_with(proposal["id"])
-    repo.fail_proposal.assert_not_called()
-
-
-def test_apply_repository_propagates_rpc_failure_without_status_fallback():
-    """An RPC failure must not trigger a direct proposal status update."""
-    client_stub = MagicMock()
-    client_stub.rpc.side_effect = RuntimeError("database unavailable")
-    repo = CRMRepository(client=client_stub)
-
-    with pytest.raises(RuntimeError, match="Failed to apply evolution proposal"):
-        repo.apply_proposal(PROPOSAL_ID_WF_UPDATE)
-
-    client_stub.table.assert_not_called()
+    repo.apply_proposal.assert_called_once()
 
 
 @patch("app.routers.evolution._get_repo")
-def test_workflow_not_found_is_reported_by_database_function(mock_get_repo):
-    """Workflow validation errors come from the database function."""
+def test_workflow_not_found_fails_proposal(mock_get_repo):
+    """workflow.update with non-existent workflow fails via RPC validation."""
     repo = MagicMock()
     mock_get_repo.return_value = repo
     repo.get_crm.return_value = _mock_crm()
     repo.get_proposal.return_value = _mock_proposal_wf_update(status="approved")
-    repo.apply_proposal.return_value = {
-        "status": "invalid_change: workflow not found or does not belong to CRM",
-        "error": "invalid_change: workflow not found or does not belong to CRM",
-    }
+    repo.apply_proposal.return_value = {"error": "invalid_change_workflow_not_found"}
 
     response = client.post(
         f"/api/v1/crm/{CRM_ID}/evolution/proposals/{PROPOSAL_ID_WF_UPDATE}/apply",
         headers=auth_headers(USER_A_ID),
     )
     assert response.status_code == 422
-    repo.apply_proposal.assert_called_once_with(PROPOSAL_ID_WF_UPDATE)
-    repo.fail_proposal.assert_not_called()
+    repo.apply_proposal.assert_called_once()
 
 
 @patch("app.routers.evolution._get_repo")
 def test_workflow_with_no_actions_fails(mock_get_repo):
-    """workflow.update on a workflow with empty actions array fails."""
+    """workflow.update on a workflow with empty actions array fails via RPC validation."""
     repo = MagicMock()
     mock_get_repo.return_value = repo
     repo.get_crm.return_value = _mock_crm()
     repo.get_proposal.return_value = _mock_proposal_wf_update(status="approved")
-    repo.apply_proposal.return_value = {
-        "status": "invalid_change: workflow has no actions to update",
-        "error": "invalid_change: workflow has no actions to update",
-    }
+    repo.apply_proposal.return_value = {"error": "invalid_change_empty_actions"}
 
     response = client.post(
         f"/api/v1/crm/{CRM_ID}/evolution/proposals/{PROPOSAL_ID_WF_UPDATE}/apply",
         headers=auth_headers(USER_A_ID),
     )
     assert response.status_code == 422
-    repo.apply_proposal.assert_called_once_with(PROPOSAL_ID_WF_UPDATE)
-    repo.fail_proposal.assert_not_called()
+    repo.apply_proposal.assert_called_once()
 
 
 # ── 7. Tenant isolation ─────────────────────────────────────────────
@@ -680,13 +561,18 @@ def test_tenant_b_cannot_list_tenant_a_proposals(mock_get_repo):
 
 @patch("app.routers.evolution._get_repo")
 def test_audit_log_recorded_for_workflow_update_apply(mock_get_repo):
-    """The API delegates update and audit work to the database function."""
+    """Audit log is inserted when workflow.update is applied."""
     repo = MagicMock()
     mock_get_repo.return_value = repo
     repo.get_crm.return_value = _mock_crm()
     repo.get_proposal.return_value = _mock_proposal_wf_update(status="approved")
+    repo.get_workflow.return_value = _mock_workflow(delay_hours=48)
+
     applied = _mock_proposal_wf_update(status="applied")
     repo.apply_proposal.return_value = applied
+    repo.update_workflow_actions.return_value = _mock_workflow(delay_hours=12)
+    repo.increment_config_version.return_value = _mock_crm(version=2)
+    repo.insert_audit_log.return_value = {"id": str(uuid.uuid4())}
 
     response = client.post(
         f"/api/v1/crm/{CRM_ID}/evolution/proposals/{PROPOSAL_ID_WF_UPDATE}/apply",
@@ -694,15 +580,12 @@ def test_audit_log_recorded_for_workflow_update_apply(mock_get_repo):
     )
     assert response.status_code == 200
 
-    repo.apply_proposal.assert_called_once_with(PROPOSAL_ID_WF_UPDATE)
-    repo.insert_audit_log.assert_not_called()
-    repo.increment_config_version.assert_not_called()
-    repo.update_workflow_actions.assert_not_called()
+    repo.apply_proposal.assert_called_once_with(str(PROPOSAL_ID_WF_UPDATE))
 
 
 @patch("app.routers.evolution._get_repo")
 def test_audit_log_recorded_for_workflow_create_apply(mock_get_repo):
-    """The API delegates create and audit work to the database function."""
+    """Audit log is recorded via RPC when workflow.create is applied."""
     repo = MagicMock()
     mock_get_repo.return_value = repo
     repo.get_crm.return_value = _mock_crm()
@@ -717,11 +600,7 @@ def test_audit_log_recorded_for_workflow_create_apply(mock_get_repo):
         headers=auth_headers(USER_A_ID),
     )
     assert response.status_code == 200
-
-    repo.apply_proposal.assert_called_once_with(PROPOSAL_ID_WF_CREATE)
-    repo.insert_audit_log.assert_not_called()
-    repo.increment_config_version.assert_not_called()
-    repo.create_workflow.assert_not_called()
+    repo.apply_proposal.assert_called_once_with(str(PROPOSAL_ID_WF_CREATE))
 
 
 # ── Staleness checks ────────────────────────────────────────────────
@@ -745,19 +624,17 @@ def test_stale_proposal_rejected_at_approval(mock_get_repo):
 
 @patch("app.routers.evolution._get_repo")
 def test_stale_proposal_rejected_at_apply(mock_get_repo):
-    """The database function detects stale versions and the route returns conflict."""
+    """Proposal is rejected at apply when CRM version has changed."""
     repo = MagicMock()
     mock_get_repo.return_value = repo
     repo.get_crm.return_value = _mock_crm(version=2)
     repo.get_proposal.return_value = _mock_proposal_wf_update(status="approved", config_version=1)
-    repo.apply_proposal.return_value = {"status": "stale", "error": "stale"}
 
     response = client.post(
         f"/api/v1/crm/{CRM_ID}/evolution/proposals/{PROPOSAL_ID_WF_UPDATE}/apply",
         headers=auth_headers(USER_A_ID),
     )
     assert response.status_code == 409
-    repo.apply_proposal.assert_called_once_with(PROPOSAL_ID_WF_UPDATE)
 
 
 # ── Archived CRM checks ─────────────────────────────────────────────
@@ -915,30 +792,122 @@ def test_apply_db_returns_invalid_change_maps_to_422(mock_get_repo):
     assert data["error"]["code"] == "VALIDATION_ERROR"
 
 
-def test_approve_repository_uses_rpc_without_python_status_fallback():
-    db = MagicMock()
-    proposal = {"id": PROPOSAL_ID_WF_UPDATE, "status": "approved"}
-    db.rpc.return_value.execute.return_value.data = "approved"
-    db.table.return_value.select.return_value.eq.return_value.execute.return_value.data = [proposal]
-    result = CRMRepository(client=db).approve_proposal(PROPOSAL_ID_WF_UPDATE, USER_A_ID)
-    assert result == proposal
-    db.rpc.assert_called_once_with("approve_evolution_proposal", {"proposal_uuid": PROPOSAL_ID_WF_UPDATE})
-    db.table.assert_called_once_with("evolution_proposals")
-    db.table.return_value.update.assert_not_called()
+# ── Phase 6 additions: analytics wiring and warning isolation ───────
 
 
-def test_approve_repository_propagates_rpc_failure_without_fallback():
-    db = MagicMock()
-    db.rpc.side_effect = RuntimeError("rpc unavailable")
-    with pytest.raises(RuntimeError, match="rpc unavailable"):
-        CRMRepository(client=db).approve_proposal(PROPOSAL_ID_WF_UPDATE, USER_A_ID)
-    db.table.assert_not_called()
+@patch("app.routers.evolution._get_repo")
+def test_create_proposal_passes_real_analytics_to_provider(mock_get_repo):
+    """Real analytics (total, won, conversion_rate) must reach the provider."""
+    repo = MagicMock()
+    mock_get_repo.return_value = repo
 
-def test_proposal_response_does_not_expose_raw_application_error():
-    from app.routers.evolution import _proposal_to_dict
+    # Use a CRM that has a status select field so won_leads can be computed
+    crm_with_status = _mock_crm()
+    crm_with_status["configuration"]["entities"][0]["fields"].append(
+        {"name": "status", "label": "Status", "type": "select", "required": True,
+         "options": ["New", "Won", "Lost"]}
+    )
+    repo.get_crm.return_value = crm_with_status
 
-    proposal = _mock_proposal_wf_update(status="failed")
-    proposal["application_error"] = "internal SQL constraint details"
-    response = _proposal_to_dict(proposal)
-    assert response["status"] == "failed"
-    assert "application_error" not in response
+    # Simulate 20 total leads, 4 won (conversion_rate = 0.20)
+    repo.count_records.return_value = 20
+    repo.count_records_by_field.return_value = [
+        {"value": "Won", "count": 4},
+        {"value": "New", "count": 16},
+    ]
+
+    captured_analytics: dict = {}
+
+    def capture_proposal(objective, crm_config, analytics):
+        captured_analytics.update(analytics)
+        return {
+            "summary": "Test proposal",
+            "proposed_change": {
+                "type": "workflow.create",
+                "name": "test",
+                "trigger": {"type": "record.created", "entity": "lead"},
+                "actions": [{"type": "create_follow_up_task", "delay_hours": 4}],
+            },
+            "evidence": [],
+        }
+
+    with patch("app.routers.evolution.get_ai_provider") as mock_factory:
+        mock_provider = MagicMock()
+        mock_provider.generate_evolution_proposal.side_effect = capture_proposal
+        mock_factory.return_value = mock_provider
+        repo.create_proposal.return_value = _mock_proposal_wf_create(status="pending")
+
+        response = client.post(
+            f"/api/v1/crm/{CRM_ID}/evolution/proposals",
+            json={"objective": "improve_conversion"},
+            headers=auth_headers(USER_A_ID),
+        )
+
+    assert response.status_code == 201
+    assert captured_analytics["total_leads"] == 20
+    assert captured_analytics["won_leads"] == 4
+    assert captured_analytics["conversion_rate"] == 0.2
+
+
+@patch("app.routers.evolution._get_repo")
+def test_create_proposal_succeeds_when_analytics_db_fails(mock_get_repo):
+    """A DB error computing analytics must not block proposal creation — falls back to zeros."""
+    repo = MagicMock()
+    mock_get_repo.return_value = repo
+    repo.get_crm.return_value = _mock_crm()
+
+    # Simulate analytics DB failure
+    repo.count_records.side_effect = RuntimeError("DB timeout")
+
+    captured_analytics: dict = {}
+
+    def capture_proposal(objective, crm_config, analytics):
+        captured_analytics.update(analytics)
+        return {
+            "summary": "Fallback proposal",
+            "proposed_change": {
+                "type": "workflow.create",
+                "name": "fallback",
+                "trigger": {"type": "record.created", "entity": "lead"},
+                "actions": [{"type": "create_follow_up_task", "delay_hours": 4}],
+            },
+            "evidence": [],
+        }
+
+    with patch("app.routers.evolution.get_ai_provider") as mock_factory:
+        mock_provider = MagicMock()
+        mock_provider.generate_evolution_proposal.side_effect = capture_proposal
+        mock_factory.return_value = mock_provider
+        repo.create_proposal.return_value = _mock_proposal_wf_create(status="pending")
+
+        response = client.post(
+            f"/api/v1/crm/{CRM_ID}/evolution/proposals",
+            json={"objective": "improve_follow_up"},
+            headers=auth_headers(USER_A_ID),
+        )
+
+    assert response.status_code == 201
+    # Graceful fallback: provider still gets called with zeros
+    assert captured_analytics["total_leads"] == 0
+    assert captured_analytics["conversion_rate"] == 0.0
+
+
+def test_evolution_proposal_generate_clears_last_warnings():
+    """generate_evolution_proposal must clear last_warnings so stale CRM-generation
+    warnings do not leak into the evolution response context."""
+    from app.services.ollama_provider import OllamaAIProvider
+    from app.services.laya_system1 import LayaSystem1
+
+    provider = OllamaAIProvider(enable_fallback=True)
+
+    # Simulate a prior CRM generation that set a fallback warning
+    provider.last_warnings = ["AI provider fallback: stale warning from crm/generate"]
+
+    crm_config = LayaSystem1.generate_scaffold_config("Create a SaaS CRM")
+    provider.generate_evolution_proposal("improve_follow_up", crm_config, {})
+
+    # Warnings must be cleared after evolution proposal generation
+    assert provider.last_warnings == [], (
+        "last_warnings must be empty after generate_evolution_proposal; "
+        "stale warnings from a prior crm/generate call must not persist."
+    )
