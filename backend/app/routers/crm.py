@@ -45,16 +45,12 @@ async def generate_crm(
     """
     try:
         provider = get_ai_provider(settings.llm_provider)
-        if hasattr(provider, "generate_crm_config_async"):
-            config_dict = await provider.generate_crm_config_async(body.prompt)
-        else:
-            config_dict = provider.generate_crm_config(body.prompt)
-        warnings = getattr(provider, "last_warnings", [])
+        config_dict = provider.generate_crm_config(body.prompt)
         # Validate with Pydantic
         config = CRMConfiguration(**config_dict)
         return success_response({
             "configuration": config.model_dump(),
-            "warnings": warnings,
+            "warnings": [],
         })
     except ValidationError as exc:
         return error_response(422, "VALIDATION_ERROR", "Generated configuration failed validation.", [

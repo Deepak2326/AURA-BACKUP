@@ -48,53 +48,53 @@ BEGIN
     IF actor_uuid IS NULL THEN
         RETURN 'unauthenticated';
     END IF;
-    
+
     -- LOCK both proposal and CRM rows, then validate all preconditions
     -- This prevents concurrent modification and ensures consistent reads
     SELECT ep.* INTO proposal_rec
     FROM public.evolution_proposals ep
     WHERE ep.id = proposal_uuid
     FOR UPDATE;
-    
+
     IF NOT FOUND THEN RETURN 'not_found'; END IF;
-    
+
     -- Lock and fetch CRM with all required fields
     SELECT c.id, c.owner_id, c.status, c.configuration_version INTO crm_rec
     FROM public.crms c
     WHERE c.id = proposal_rec.crm_id
     FOR UPDATE;
-    
+
     IF NOT FOUND THEN RETURN 'crm_not_found'; END IF;
-    
+
     -- AUTHORIZATION: Verify ownership (must be CRM owner)
     IF crm_rec.owner_id != actor_uuid THEN RETURN 'not_owner'; END IF;
-    
+
     -- ACTIVE CHECK: CRM must be active
     IF crm_rec.status != 'active' THEN RETURN 'crm_archived'; END IF;
-    
+
     -- STATUS CHECK: Proposal must be approved
     IF proposal_rec.status != 'approved' THEN RETURN 'not_approved'; END IF;
-    
+
     -- STALENESS CHECK: Configuration version must match
     IF crm_rec.configuration_version != proposal_rec.configuration_version_at_creation THEN
-        UPDATE public.evolution_proposals 
+        UPDATE public.evolution_proposals
         SET status = 'stale', updated_at = NOW()
         WHERE id = proposal_uuid;
         RETURN 'stale';
     END IF;
-    
+
     change_type := proposal_rec.proposed_change->>'type';
-    
+
     -- ALLOWLIST: Only specific change types are permitted
     -- Never execute arbitrary SQL or code from proposed_change JSON
-    
+
     CASE change_type
         WHEN 'workflow.update' THEN
             -- VALIDATE: Required fields exist
             IF NOT proposal_rec.proposed_change ? 'workflow_id' OR NOT proposal_rec.proposed_change ? 'delay_hours' THEN
                 RETURN 'invalid_change: missing workflow_id or delay_hours';
             END IF;
-            
+
             -- VALIDATE: workflow_id is a valid UUID
             workflow_id_text := proposal_rec.proposed_change->>'workflow_id';
             BEGIN
@@ -102,7 +102,7 @@ BEGIN
             EXCEPTION WHEN OTHERS THEN
                 RETURN 'invalid_change: workflow_id is not a valid UUID';
             END;
-            
+
             -- VALIDATE: delay_hours is a valid integer in range
             delay_hours_text := proposal_rec.proposed_change->>'delay_hours';
             BEGIN
@@ -110,35 +110,35 @@ BEGIN
             EXCEPTION WHEN OTHERS THEN
                 RETURN 'invalid_change: delay_hours is not a valid integer';
             END;
-            
+
             IF new_delay_hours < 0 OR new_delay_hours > 8760 THEN
                 RETURN 'invalid_change: delay_hours out of range (0-8760)';
             END IF;
-            
+
             -- LOCK and fetch workflow, verify belongs to same CRM
             SELECT to_jsonb(w) INTO workflow_old
             FROM public.workflows w
             WHERE w.id = workflow_uuid AND w.crm_id = proposal_rec.crm_id
             FOR UPDATE;
-            
+
             IF workflow_old IS NULL THEN
                 RETURN 'invalid_change: workflow not found or does not belong to CRM';
             END IF;
-            
+
             -- VALIDATE: workflow has actions array
             IF workflow_old->'actions' IS NULL OR jsonb_typeof(workflow_old->'actions') != 'array' THEN
                 RETURN 'invalid_change: workflow has no actions array';
             END IF;
-            
+
             IF jsonb_array_length(workflow_old->'actions') = 0 THEN
                 RETURN 'invalid_change: workflow has no actions to update';
             END IF;
-            
+
             -- VALIDATE: target action index exists and has delay_hours field
             IF NOT (workflow_old->'actions'->0 ? 'delay_hours') THEN
                 RETURN 'invalid_change: first action has no delay_hours field';
             END IF;
-            
+
             -- ATOMIC: Update workflow, increment version, update proposal, insert audit
             -- All in one transaction - any failure rolls back everything
             BEGIN
@@ -153,26 +153,26 @@ BEGIN
                     to_jsonb(new_delay_hours)
                 )
                 WHERE id = workflow_uuid AND crm_id = proposal_rec.crm_id;
-                
+
                 IF NOT FOUND THEN
                     RAISE EXCEPTION 'Workflow update failed';
                 END IF;
-                
+
                 -- Build workflow_new from the updated row (avoids composite type issue)
                 SELECT to_jsonb(w) INTO workflow_new
                 FROM public.workflows w
                 WHERE w.id = workflow_uuid;
-                
+
                 -- Increment CRM configuration version
                 UPDATE public.crms
                 SET configuration_version = configuration_version + 1, updated_at = NOW()
                 WHERE id = proposal_rec.crm_id;
-                
+
                 -- Update proposal status
                 UPDATE public.evolution_proposals
                 SET status = 'applied', applied_at = NOW(), applied_by = actor_uuid, updated_at = NOW()
                 WHERE id = proposal_uuid;
-                
+
                 -- Insert audit log with both old and new workflow states
                 INSERT INTO public.audit_logs (crm_id, crm_owner_id, user_id, action, entity_type, entity_id, old_values, new_values, metadata)
                 VALUES (
@@ -186,12 +186,12 @@ BEGIN
                     jsonb_build_object('workflow', workflow_new, 'change_type', change_type, 'workflow_id', workflow_uuid),
                     jsonb_build_object('source', 'database_function', 'proposal_id', proposal_uuid)
                 );
-                
+
             EXCEPTION WHEN OTHERS THEN
                 -- Transaction will roll back automatically
                 -- Record failure in separate transaction
                 BEGIN
-                    UPDATE public.evolution_proposals 
+                    UPDATE public.evolution_proposals
                     SET status = 'failed', application_error = SQLERRM, updated_at = NOW()
                     WHERE id = proposal_uuid;
                 EXCEPTION WHEN OTHERS THEN
@@ -200,62 +200,62 @@ BEGIN
                 END;
                 RETURN 'apply_failed';
             END;
-            
+
         WHEN 'workflow.create' THEN
             -- VALIDATE: Required fields
             IF NOT proposal_rec.proposed_change ? 'name' OR NOT proposal_rec.proposed_change ? 'trigger' THEN
                 RETURN 'invalid_change: missing name or trigger';
             END IF;
-            
+
             workflow_name := proposal_rec.proposed_change->>'name';
             workflow_trigger := proposal_rec.proposed_change->'trigger';
             workflow_actions := COALESCE(proposal_rec.proposed_change->'actions', '[{"type": "create_follow_up_task", "delay_hours": 24}]'::jsonb);
-            
+
             -- VALIDATE: name is non-empty
             IF workflow_name IS NULL OR length(trim(workflow_name)) = 0 THEN
                 RETURN 'invalid_change: workflow name must be non-empty';
             END IF;
-            
+
             -- VALIDATE: trigger has 'type' field with allowlisted value
             IF workflow_trigger IS NULL OR jsonb_typeof(workflow_trigger) != 'object' THEN
                 RETURN 'invalid_change: trigger must be a JSON object';
             END IF;
-            
+
             IF NOT workflow_trigger ? 'type' THEN
                 RETURN 'invalid_change: trigger must have a type field';
             END IF;
-            
+
             trigger_type := workflow_trigger->>'type';
             -- ALLOWLIST: trigger types
             IF trigger_type NOT IN ('record.created', 'record.updated', 'record.stage_changed') THEN
                 RETURN 'invalid_change: trigger type not allowlisted';
             END IF;
-            
+
             -- VALIDATE: actions is an array
             IF jsonb_typeof(workflow_actions) != 'array' THEN
                 RETURN 'invalid_change: actions must be an array';
             END IF;
-            
+
             IF jsonb_array_length(workflow_actions) = 0 THEN
                 RETURN 'invalid_change: actions must be a non-empty array';
             END IF;
-            
+
             -- VALIDATE: each action has allowlisted type
             FOR action_idx IN SELECT generate_series(0, jsonb_array_length(workflow_actions) - 1) LOOP
                 action_rec := jsonb_build_object(
                     'idx', action_idx,
                     'action', workflow_actions->action_idx
                 );
-                
+
                 IF NOT (workflow_actions->action_idx ? 'type') THEN
                     RETURN format('invalid_change: action at index %s has no type field', action_idx);
                 END IF;
-                
+
                 -- ALLOWLIST: action types
                 IF (workflow_actions->action_idx->>'type') NOT IN ('create_follow_up_task', 'notify_owner', 'send_email') THEN
                     RETURN format('invalid_change: action type at index %s not allowlisted', action_idx);
                 END IF;
-                
+
                 -- VALIDATE: create_follow_up_task requires delay_hours as valid integer in range 0-8760
                 IF (workflow_actions->action_idx->>'type') = 'create_follow_up_task' THEN
                     IF NOT (workflow_actions->action_idx ? 'delay_hours') THEN
@@ -271,7 +271,7 @@ BEGIN
                     END IF;
                 END IF;
             END LOOP;
-            
+
             -- ATOMIC: Create workflow, increment version, update proposal, insert audit
             -- FIXED: Avoid RETURNING id, to_jsonb(workflows) which creates anonymous composite type
             BEGIN
@@ -285,7 +285,7 @@ BEGIN
                     'draft'  -- New workflows start as drafts for review
                 )
                 RETURNING id INTO workflow_uuid;
-                
+
                 -- Build workflow_new JSONB manually from known values (avoids composite type issue)
                 workflow_new := jsonb_build_object(
                     'id', workflow_uuid,
@@ -297,17 +297,17 @@ BEGIN
                     'created_at', NOW(),
                     'updated_at', NOW()
                 );
-                
+
                 -- Increment CRM configuration version
                 UPDATE public.crms
                 SET configuration_version = configuration_version + 1, updated_at = NOW()
                 WHERE id = proposal_rec.crm_id;
-                
+
                 -- Update proposal status
                 UPDATE public.evolution_proposals
                 SET status = 'applied', applied_at = NOW(), applied_by = actor_uuid, updated_at = NOW()
                 WHERE id = proposal_uuid;
-                
+
                 -- Insert audit log
                 INSERT INTO public.audit_logs (crm_id, crm_owner_id, user_id, action, entity_type, entity_id, old_values, new_values, metadata)
                 VALUES (
@@ -321,10 +321,10 @@ BEGIN
                     jsonb_build_object('workflow', workflow_new, 'change_type', change_type, 'workflow_id', workflow_uuid),
                     jsonb_build_object('source', 'database_function', 'proposal_id', proposal_uuid)
                 );
-                
+
             EXCEPTION WHEN OTHERS THEN
                 BEGIN
-                    UPDATE public.evolution_proposals 
+                    UPDATE public.evolution_proposals
                     SET status = 'failed', application_error = SQLERRM, updated_at = NOW()
                     WHERE id = proposal_uuid;
                 EXCEPTION WHEN OTHERS THEN
@@ -332,11 +332,11 @@ BEGIN
                 END;
                 RETURN 'apply_failed';
             END;
-            
+
         ELSE
             RETURN 'invalid_change: unknown change type';
     END CASE;
-    
+
     RETURN 'applied';
 END;
 $$ LANGUAGE plpgsql;

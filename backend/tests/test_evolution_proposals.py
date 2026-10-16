@@ -225,17 +225,8 @@ def test_apply_workflow_update_proposal(mock_get_repo):
     data = response.json()["data"]
     assert data["status"] == "applied"
 
-    # Verify the workflow actions were updated correctly
-    repo.update_workflow_actions.assert_called_once()
-    call_args = repo.update_workflow_actions.call_args
-    updated_actions = call_args[1].get("actions") if call_args[1] else call_args[0][2]
-    assert updated_actions[0]["delay_hours"] == 12
-
-    # Verify config version was incremented
-    repo.increment_config_version.assert_called_once()
-
-    # Verify audit log was inserted
-    repo.insert_audit_log.assert_called_once()
+    # Verify apply_proposal RPC was invoked atomically
+    repo.apply_proposal.assert_called_once_with(str(PROPOSAL_ID_WF_UPDATE))
 
 
 # ── 2. Successful workflow.create ───────────────────────────────────
@@ -274,19 +265,8 @@ def test_apply_workflow_create_proposal(mock_get_repo):
     data = response.json()["data"]
     assert data["status"] == "applied"
 
-    # Verify exactly one workflow was created
-    repo.create_workflow.assert_called_once()
-    call_kwargs = repo.create_workflow.call_args[1]
-    assert call_kwargs["name"] == "Onboarding Follow-up"
-    assert call_kwargs["status"] == "draft"
-
-    # Verify config version was incremented
-    repo.increment_config_version.assert_called_once()
-
-    # Verify audit log was inserted with new workflow_id
-    repo.insert_audit_log.assert_called_once()
-    audit_kwargs = repo.insert_audit_log.call_args[1]
-    assert audit_kwargs["new_values"]["workflow_id"] == new_wf_id
+    # Verify apply_proposal RPC was invoked atomically
+    repo.apply_proposal.assert_called_once_with(str(PROPOSAL_ID_WF_CREATE))
 
 
 # ── 3. Rejected proposal cannot be applied ──────────────────────────
@@ -360,7 +340,7 @@ def test_workflow_update_missing_workflow_id(mock_get_repo):
         headers=auth_headers(USER_A_ID),
     )
     assert response.status_code == 422
-    repo.fail_proposal.assert_called_once()
+    repo.apply_proposal.assert_not_called()
 
 
 @patch("app.routers.evolution._get_repo")
@@ -378,7 +358,7 @@ def test_workflow_update_missing_delay_hours(mock_get_repo):
         headers=auth_headers(USER_A_ID),
     )
     assert response.status_code == 422
-    repo.fail_proposal.assert_called_once()
+    repo.apply_proposal.assert_not_called()
 
 
 @patch("app.routers.evolution._get_repo")
@@ -396,7 +376,7 @@ def test_workflow_create_missing_name(mock_get_repo):
         headers=auth_headers(USER_A_ID),
     )
     assert response.status_code == 422
-    repo.fail_proposal.assert_called_once()
+    repo.apply_proposal.assert_not_called()
 
 
 @patch("app.routers.evolution._get_repo")
@@ -414,7 +394,7 @@ def test_unsupported_change_type_fails_at_apply(mock_get_repo):
         headers=auth_headers(USER_A_ID),
     )
     assert response.status_code == 422
-    repo.fail_proposal.assert_called_once()
+    repo.apply_proposal.assert_not_called()
 
 
 # ── 5. Duplicate application prevented ──────────────────────────────
@@ -470,55 +450,49 @@ def test_application_failure_marks_proposal_failed(mock_get_repo):
     repo.get_proposal.return_value = _mock_proposal_wf_update(status="approved")
     repo.get_workflow.return_value = _mock_workflow()
 
-    # Simulate a database error during workflow update
-    repo.update_workflow_actions.side_effect = RuntimeError("Database connection lost")
+    # Simulate a database error during apply_proposal
+    repo.apply_proposal.side_effect = RuntimeError("Database connection lost")
 
     response = client.post(
         f"/api/v1/crm/{CRM_ID}/evolution/proposals/{PROPOSAL_ID_WF_UPDATE}/apply",
         headers=auth_headers(USER_A_ID),
     )
     assert response.status_code == 500
-
-    # Proposal must be marked as failed
-    repo.fail_proposal.assert_called_once()
-    fail_args = repo.fail_proposal.call_args
-    assert "Database connection lost" in str(fail_args)
+    repo.apply_proposal.assert_called_once()
 
 
 @patch("app.routers.evolution._get_repo")
 def test_workflow_not_found_fails_proposal(mock_get_repo):
-    """workflow.update with non-existent workflow fails and marks proposal."""
+    """workflow.update with non-existent workflow fails via RPC validation."""
     repo = MagicMock()
     mock_get_repo.return_value = repo
     repo.get_crm.return_value = _mock_crm()
     repo.get_proposal.return_value = _mock_proposal_wf_update(status="approved")
-    repo.get_workflow.return_value = None  # Workflow not found
+    repo.apply_proposal.return_value = {"error": "invalid_change_workflow_not_found"}
 
     response = client.post(
         f"/api/v1/crm/{CRM_ID}/evolution/proposals/{PROPOSAL_ID_WF_UPDATE}/apply",
         headers=auth_headers(USER_A_ID),
     )
     assert response.status_code == 422
-    repo.fail_proposal.assert_called_once()
+    repo.apply_proposal.assert_called_once()
 
 
 @patch("app.routers.evolution._get_repo")
 def test_workflow_with_no_actions_fails(mock_get_repo):
-    """workflow.update on a workflow with empty actions array fails."""
+    """workflow.update on a workflow with empty actions array fails via RPC validation."""
     repo = MagicMock()
     mock_get_repo.return_value = repo
     repo.get_crm.return_value = _mock_crm()
     repo.get_proposal.return_value = _mock_proposal_wf_update(status="approved")
-    empty_wf = _mock_workflow()
-    empty_wf["actions"] = []
-    repo.get_workflow.return_value = empty_wf
+    repo.apply_proposal.return_value = {"error": "invalid_change_empty_actions"}
 
     response = client.post(
         f"/api/v1/crm/{CRM_ID}/evolution/proposals/{PROPOSAL_ID_WF_UPDATE}/apply",
         headers=auth_headers(USER_A_ID),
     )
     assert response.status_code == 422
-    repo.fail_proposal.assert_called_once()
+    repo.apply_proposal.assert_called_once()
 
 
 # ── 7. Tenant isolation ─────────────────────────────────────────────
@@ -606,48 +580,27 @@ def test_audit_log_recorded_for_workflow_update_apply(mock_get_repo):
     )
     assert response.status_code == 200
 
-    repo.insert_audit_log.assert_called_once()
-    audit_kwargs = repo.insert_audit_log.call_args[1]
-    assert audit_kwargs["action"] == "apply"
-    assert audit_kwargs["entity_type"] == "evolution_proposal"
-    assert audit_kwargs["entity_id"] == PROPOSAL_ID_WF_UPDATE
-    assert audit_kwargs["crm_id"] == CRM_ID
-    assert audit_kwargs["user_id"] == USER_A_ID
-    # Old values should contain old actions
-    assert "actions" in audit_kwargs["old_values"]
-    assert audit_kwargs["old_values"]["actions"][0]["delay_hours"] == 48
-    # New values should contain updated delay_hours
-    assert audit_kwargs["new_values"]["delay_hours"] == 12
+    repo.apply_proposal.assert_called_once_with(str(PROPOSAL_ID_WF_UPDATE))
 
 
 @patch("app.routers.evolution._get_repo")
 def test_audit_log_recorded_for_workflow_create_apply(mock_get_repo):
-    """Audit log is inserted when workflow.create is applied."""
+    """Audit log is recorded via RPC when workflow.create is applied."""
     repo = MagicMock()
     mock_get_repo.return_value = repo
     repo.get_crm.return_value = _mock_crm()
     repo.get_proposal.return_value = _mock_proposal_wf_create(status="approved")
 
-    new_wf_id = str(uuid.uuid4())
-    repo.create_workflow.return_value = {"id": new_wf_id}
     applied = _mock_proposal_wf_create(status="approved")
     applied["status"] = "applied"
     repo.apply_proposal.return_value = applied
-    repo.increment_config_version.return_value = _mock_crm(version=2)
-    repo.insert_audit_log.return_value = {"id": str(uuid.uuid4())}
 
     response = client.post(
         f"/api/v1/crm/{CRM_ID}/evolution/proposals/{PROPOSAL_ID_WF_CREATE}/apply",
         headers=auth_headers(USER_A_ID),
     )
     assert response.status_code == 200
-
-    repo.insert_audit_log.assert_called_once()
-    audit_kwargs = repo.insert_audit_log.call_args[1]
-    assert audit_kwargs["action"] == "apply"
-    assert audit_kwargs["entity_type"] == "evolution_proposal"
-    assert audit_kwargs["new_values"]["workflow_id"] == new_wf_id
-    assert audit_kwargs["new_values"]["name"] == "Onboarding Follow-up"
+    repo.apply_proposal.assert_called_once_with(str(PROPOSAL_ID_WF_CREATE))
 
 
 # ── Staleness checks ────────────────────────────────────────────────
