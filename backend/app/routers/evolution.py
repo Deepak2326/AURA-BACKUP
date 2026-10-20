@@ -75,8 +75,29 @@ async def create_proposal(
 
     config = CRMConfiguration(**crm["configuration"])
 
-    # Compute basic analytics for the AI
-    analytics_data = {"total_leads": 0}
+    # Compute real analytics to give Laya accurate ranking signals.
+    # Gracefully fall back to zeros if the DB call fails so proposal creation
+    # is never blocked by an analytics read error.
+    analytics_data: dict = {"total_leads": 0, "won_leads": 0, "conversion_rate": 0.0}
+    try:
+        primary_entity = config.entities[0].name if config.entities else "lead"
+        total = repo.count_records(str(crm_id), primary_entity)
+        analytics_data["total_leads"] = total
+
+        # Derive won_leads from the stage/status select field options
+        stage_field = next(
+            (f for f in config.entities[0].fields if f.name in ("status", "stage") and f.type == "select"),
+            None,
+        ) if config.entities else None
+
+        if stage_field and total > 0:
+            won_stages = {"Won", "won", "Closed Won", "closed_won"}
+            by_stage = repo.count_records_by_field(str(crm_id), primary_entity, stage_field.name)
+            won = sum(entry.get("count", 0) for entry in by_stage if entry.get("value") in won_stages)
+            analytics_data["won_leads"] = won
+            analytics_data["conversion_rate"] = round(won / total, 4)
+    except Exception:
+        pass  # analytics failure must never block proposal generation
 
     try:
         provider = get_ai_provider(settings.llm_provider)
@@ -201,8 +222,26 @@ async def apply_proposal(
     if proposal["status"] != "approved":
         return error_response(422, "VALIDATION_ERROR", f"Proposal is '{proposal['status']}', not approved.")
 
-    # The database function is authoritative for validation, staleness, and
-    # every mutation. The route only checks access and translates its result.
+    # Staleness check
+    if proposal.get("configuration_version_at_creation") != crm.get("configuration_version"):
+        return error_response(409, "CONFLICT", "Configuration has changed since proposal creation.")
+
+    # Validate change payload
+    change = proposal.get("proposed_change", {})
+    change_type = change.get("type")
+    if change_type not in ("workflow.update", "workflow.create"):
+        return error_response(422, "VALIDATION_ERROR", "Proposed change type not allowlisted.")
+    if change_type == "workflow.update":
+        if not change.get("workflow_id"):
+            return error_response(422, "VALIDATION_ERROR", "workflow.update requires workflow_id.")
+        if "delay_hours" not in change or change.get("delay_hours") is None:
+            return error_response(422, "VALIDATION_ERROR", "workflow.update requires delay_hours.")
+    elif change_type == "workflow.create":
+        if not change.get("name"):
+            return error_response(422, "VALIDATION_ERROR", "workflow.create requires non-empty name.")
+
+    # The database function is authoritative for atomic execution in PostgreSQL.
+    # The route checks access and translates its result.
     try:
         result = repo.apply_proposal(str(proposal_id))
 

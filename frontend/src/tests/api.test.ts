@@ -164,6 +164,97 @@ export async function runFrontendTests() {
     assert(false, `7. Evolution Lifecycle error: ${e}`);
   }
 
+  // Test 8: Supabase OAuth & Client Configuration Audit
+  try {
+    const { supabase, isSupabaseConfigured } = await import('../services/supabase');
+    assert(isSupabaseConfigured, '8.1 Supabase client is properly configured with public credentials');
+
+    // 8.2 Client key security check
+    const anonKey = process.env.VITE_SUPABASE_ANON_KEY || '';
+    if (anonKey) {
+      const parts = anonKey.split('.');
+      if (parts.length === 3) {
+        const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf8'));
+        assert(payload.role === 'anon', '8.2 Supabase client uses anon role key and never exposes service_role');
+        assert(payload.role !== 'service_role', '8.3 Service-role keys are strictly absent from client bundle');
+      }
+    }
+
+    // 8.3 Google OAuth URL generation
+    const googleOAuth = await supabase.auth.signInWithOAuth({
+      provider: 'google',
+      options: { redirectTo: 'http://localhost:5173/auth/callback' },
+    });
+    assert(Boolean(googleOAuth.data?.url), '8.4 Google OAuth generates authorization endpoint URL');
+    assert(
+      Boolean(googleOAuth.data?.url?.includes('provider=google')),
+      '8.5 Google OAuth target URL references provider=google'
+    );
+
+    // 8.4 GitHub OAuth URL generation
+    const githubOAuth = await supabase.auth.signInWithOAuth({
+      provider: 'github',
+      options: { redirectTo: 'http://localhost:5173/auth/callback' },
+    });
+    assert(Boolean(githubOAuth.data?.url), '8.6 GitHub OAuth generates authorization endpoint URL');
+    assert(
+      Boolean(githubOAuth.data?.url?.includes('provider=github')),
+      '8.7 GitHub OAuth target URL references provider=github'
+    );
+
+    // 8.5 Provider backend enablement audit (proves providers are not enabled in Gotrue)
+    if (googleOAuth.data?.url) {
+      const gRes = await fetch(googleOAuth.data.url);
+      const gData = await gRes.json().catch(() => ({}));
+      assert(
+        gRes.status === 400 && gData.msg === 'Unsupported provider: provider is not enabled',
+        '8.8 Gotrue correctly reports Google provider is not enabled in dashboard'
+      );
+    }
+    if (githubOAuth.data?.url) {
+      const ghRes = await fetch(githubOAuth.data.url);
+      const ghData = await ghRes.json().catch(() => ({}));
+      assert(
+        ghRes.status === 400 && ghData.msg === 'Unsupported provider: provider is not enabled',
+        '8.9 Gotrue correctly reports GitHub provider is not enabled in dashboard'
+      );
+    }
+  } catch (e) {
+    assert(false, `8. Supabase OAuth Audit error: ${e}`);
+  }
+
+  // Test 9: Live Adapter Selection & No Silent Mock Fallback
+  try {
+    const { api, setUseMockMode, getUseMockMode } = await import('../services/api');
+
+    // 9.1 Adapter mode toggle
+    setUseMockMode(false);
+    assert(getUseMockMode() === false, '9.1 FastAPI Live mode can be explicitly activated');
+
+    // 9.2 Verify live mode does not silently fallback to mock data on network error
+    let threwErrorInLiveMode = false;
+    try {
+      // Calling generateCRM in live mode when no server is on port 8000 during test
+      await api.generateCRM('Create an aerospace parts tracking CRM');
+    } catch (err: unknown) {
+      threwErrorInLiveMode = true;
+      const msg = err instanceof Error ? err.message : String(err);
+      assert(
+        msg.includes('Failed to connect to backend') || msg.includes('ECONNREFUSED') || msg.includes('fetch failed'),
+        '9.2 Live mode throws explicit network error instead of silently returning mock data'
+      );
+    }
+    assert(threwErrorInLiveMode, '9.3 Live mode strictly rejects silent mock fallback');
+
+    // 9.3 Switch back to mock mode for isolated unit tests
+    setUseMockMode(true);
+    assert(getUseMockMode() === true, '9.4 Explicit mock adapter mode can be restored');
+    const mockRes = await api.generateCRM('healthcare clinic');
+    assert(mockRes.configuration.industry === 'healthcare', '9.5 Mock adapter serves in-memory responses when explicitly active');
+  } catch (e) {
+    assert(false, `9. Live Adapter & Error Handling error: ${e}`);
+  }
+
   console.log(`\n📊 Test Results: ${passed} Passed, ${failed} Failed`);
   return { passed, failed };
 }

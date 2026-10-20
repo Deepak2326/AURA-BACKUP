@@ -7,11 +7,13 @@ import { ProtectedRoute } from '@/features/auth/ProtectedRoute';
 import { LoginPage } from '@/features/auth/LoginPage';
 import { RegisterPage } from '@/features/auth/RegisterPage';
 import { ForgotPasswordPage } from '@/features/auth/ForgotPasswordPage';
+import { AuthCallbackPage } from '@/features/auth/AuthCallbackPage';
 import { AppLayout } from '@/components/layout/AppLayout';
 import { DashboardPage } from '@/features/dashboard/DashboardPage';
 import { CRMListPage } from '@/features/crms/CRMListPage';
 import { CRMDetailPage } from '@/features/crms/CRMDetailPage';
 import { CRMGeneratorPage } from '@/features/crm-generator/CRMGeneratorPage';
+import { CRMChatPage } from '@/features/crm-chat/CRMChatPage';
 import { RecordsPage } from '@/features/records/RecordsPage';
 import { WorkflowsPage } from '@/features/workflows/WorkflowsPage';
 import { AnalyticsPage } from '@/features/analytics/AnalyticsPage';
@@ -29,6 +31,7 @@ export const App: React.FC = () => {
               <Route path="/login" element={<LoginPage />} />
               <Route path="/register" element={<RegisterPage />} />
               <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+              <Route path="/auth/callback" element={<AuthCallbackPage />} />
 
               {/* Protected Workspace Routes */}
               <Route element={<ProtectedRoute />}>
@@ -38,6 +41,7 @@ export const App: React.FC = () => {
                   <Route path="/crms" element={<CRMListPage />} />
                   <Route path="/crms/:crmId" element={<CRMDetailPage />} />
                   <Route path="/create-crm" element={<CRMGeneratorPage />} />
+                  <Route path="/chat-crm" element={<CRMChatPage />} />
                   <Route path="/records" element={<RecordsPage />} />
                   <Route path="/workflows" element={<WorkflowsPage />} />
                   <Route path="/analytics" element={<AnalyticsPage />} />

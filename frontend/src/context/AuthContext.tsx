@@ -11,6 +11,7 @@ interface AuthContextType {
   isMockMode: boolean;
   signIn: (email: string, password: string) => Promise<{ error?: string }>;
   signUp: (email: string, password: string) => Promise<{ error?: string; message?: string }>;
+  signInWithOAuth: (provider: 'google' | 'github') => Promise<{ error?: string }>;
   signOut: () => Promise<void>;
   resetPassword: (email: string) => Promise<{ error?: string; message?: string }>;
   loginAsDemoUser: () => void;
@@ -36,38 +37,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [isMockMode, setIsMockModeState] = useState<boolean>(getUseMockMode());
 
   useEffect(() => {
-    // Check if demo user was logged in previously
-    const isDemoStored = localStorage.getItem('aura_demo_session') === 'true';
-    if (isDemoStored) {
-      setUser(DEMO_USER);
-      setUseMockMode(true);
-      setIsMockModeState(true);
-      setIsLoading(false);
-      return;
-    }
-
-    if (!isSupabaseConfigured) {
-      // If Supabase credentials are not configured, default to demo mode or prompt login
-      setIsLoading(false);
-      return;
-    }
-
-    // Initialize real Supabase session
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setSession(session);
-      setUser(session?.user ?? null);
-      if (session) {
-        setUseMockMode(false);
-        setIsMockModeState(false);
-      }
-      setIsLoading(false);
-    }).catch(() => {
-      setIsLoading(false);
-    });
-
-    // Subscribe to auth state changes
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(
-      (_event, session) => {
+    if (isSupabaseConfigured) {
+      // Live authentication configured: do NOT auto-activate demo session
+      // Initialize real Supabase session
+      supabase.auth.getSession().then(({ data: { session } }) => {
         setSession(session);
         setUser(session?.user ?? null);
         if (session) {
@@ -76,19 +49,42 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           setIsMockModeState(false);
         }
         setIsLoading(false);
-      }
-    );
+      }).catch(() => {
+        setIsLoading(false);
+      });
 
-    return () => {
-      subscription.unsubscribe();
-    };
+      // Subscribe to auth state changes
+      const { data: { subscription } } = supabase.auth.onAuthStateChange(
+        (_event, session) => {
+          setSession(session);
+          setUser(session?.user ?? null);
+          if (session) {
+            localStorage.removeItem('aura_demo_session');
+            setUseMockMode(false);
+            setIsMockModeState(false);
+          }
+          setIsLoading(false);
+        }
+      );
+
+      return () => {
+        subscription.unsubscribe();
+      };
+    } else {
+      // If Supabase credentials are not configured, check if demo user was explicitly chosen
+      const isDemoStored = localStorage.getItem('aura_demo_session') === 'true';
+      if (isDemoStored) {
+        setUser(DEMO_USER);
+        setUseMockMode(true);
+        setIsMockModeState(true);
+      }
+      setIsLoading(false);
+    }
   }, []);
 
   const signIn = async (email: string, password: string) => {
     if (!isSupabaseConfigured) {
-      // Fallback for development if Supabase credentials are not yet supplied
-      loginAsDemoUser();
-      return {};
+      return { error: 'Supabase credentials are not configured in environment. Please set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY in frontend/.env.' };
     }
     const { error, data } = await supabase.auth.signInWithPassword({ email, password });
     if (error) {
@@ -104,8 +100,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const signUp = async (email: string, password: string) => {
     if (!isSupabaseConfigured) {
-      loginAsDemoUser();
-      return { message: 'Demo account registered successfully.' };
+      return { error: 'Supabase credentials are not configured in environment. Please set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY in frontend/.env.' };
     }
     const { error, data } = await supabase.auth.signUp({ email, password });
     if (error) {
@@ -130,13 +125,55 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const resetPassword = async (email: string) => {
     if (!isSupabaseConfigured) {
-      return { message: 'Password recovery email sent (demo mode simulation).' };
+      return { error: 'Supabase credentials are not configured in environment. Please set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY in frontend/.env.' };
     }
     const { error } = await supabase.auth.resetPasswordForEmail(email);
     if (error) {
       return { error: error.message };
     }
     return { message: 'Password reset link sent to your email.' };
+  };
+
+  const signInWithOAuth = async (provider: 'google' | 'github'): Promise<{ error?: string }> => {
+    if (!isSupabaseConfigured) {
+      return { error: 'Supabase authentication is not configured in environment.' };
+    }
+    try {
+      const callbackUrl = `${window.location.origin}/auth/callback`;
+      const { data, error } = await supabase.auth.signInWithOAuth({
+        provider,
+        options: {
+          redirectTo: callbackUrl,
+        },
+      });
+
+      if (error) {
+        return { error: error.message };
+      }
+
+      if (data?.url) {
+        // Pre-flight check to verify if the provider is enabled before leaving SPA
+        try {
+          const probe = await fetch(data.url, { method: 'GET' });
+          if (probe.status === 400) {
+            const body = await probe.json().catch(() => null);
+            const msg = body?.msg || body?.message || 'Unsupported provider: provider is not enabled';
+            return {
+              error: `${provider === 'google' ? 'Google' : 'GitHub'} OAuth not configured: ${msg}. Provider credentials must be enabled in the Supabase Dashboard.`,
+            };
+          }
+        } catch {
+          // If cross-origin redirect throws, provider is active and redirecting
+        }
+
+        window.location.href = data.url;
+        return {};
+      }
+
+      return { error: 'Failed to generate OAuth authorization URL.' };
+    } catch (err: any) {
+      return { error: err.message || 'OAuth sign-in failed.' };
+    }
   };
 
   const loginAsDemoUser = () => {
@@ -161,6 +198,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         isMockMode,
         signIn,
         signUp,
+        signInWithOAuth,
         signOut,
         resetPassword,
         loginAsDemoUser,

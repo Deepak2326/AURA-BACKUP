@@ -1,9 +1,16 @@
 # Self-Evolving CRM — API Contracts
 
-**Status:** MVP contract v1  
+**Status:** MVP contract v2 — implemented and live on `ccoxnsdyhbrvbghcefkt`
 **Base path:** `/api/v1`  
 **Content type:** `application/json`, except CSV import (`multipart/form-data`)  
 **Source of truth:** This document plus `backend/app/schemas/crm.py`. If either changes, update both in the same pull request.
+
+## Implementation Status
+
+**IMPLEMENTED**: All FastAPI routes and Pydantic schemas described in this document are
+implemented in `backend/app/routers/` and `backend/app/schemas/crm.py`. The Supabase
+initial migration has been applied to project `ccoxnsdyhbrvbghcefkt`. This document
+and the backend schemas are kept in sync; update both together in the same pull request.
 
 ## 1. Architecture decisions
 
@@ -420,7 +427,7 @@ Success `201`:
 ```json
 {
   "data": {
-    "record_id": "uuid",
+    "id": "uuid",
     "crm_id": "uuid",
     "entity_name": "lead",
     "data": {
@@ -483,7 +490,7 @@ Success `200`:
 ```json
 {
   "data": {
-    "imported": 18,
+    "created": 18,
     "skipped": 2,
     "errors": [
       {"row": 4, "code": "INVALID_EMAIL", "message": "Email is invalid."}
@@ -506,7 +513,7 @@ Request:
 ```json
 {
   "name": "Follow up after new lead",
-  "trigger": {"event": "record.created", "entity": "lead"},
+  "trigger": {"type": "record.created", "entity": "lead"},
   "actions": [
     {
       "type": "create_follow_up_task",
@@ -580,17 +587,127 @@ AI suggestions must cite computed metrics or observed events as evidence. A prop
 
 `POST /api/v1/crm/{crm_id}/evolution/proposals/{proposal_id}/approve`
 
-Auth: required. Request:
+Auth: required.
+
+**Two-stage approval process:** Approval marks the proposal as ready for application but does NOT apply the change. A separate apply endpoint applies the approved change.
+
+Request:
 
 ```json
 {
-  "expected_status": "pending"
+  "expected_status": "pending",
+  "expected_version": 5
 }
 ```
 
-Success `200`: returns the proposal with `status: "applied"` if validation and authorization succeed. Approval must be explicit and recorded in an audit log. Revalidate at approval time, use version checks, and make repeated approval requests idempotent where possible. Reject stale proposals with `409`.
+- `expected_status`: Must be `"pending"`. Returns `422` if proposal is not pending.
+- `expected_version`: Optional CRM configuration version for optimistic locking. Returns `409` if version mismatch.
 
-### 5.15 Reject a proposal
+Success `200`:
+
+```json
+{
+  "data": {
+    "proposal_id": "uuid",
+    "status": "approved",
+    "summary": "Follow up sooner after a demo.",
+    "proposed_change": {
+      "type": "workflow.update",
+      "workflow_id": "uuid",
+      "delay_hours": 12
+    },
+    "evidence": [],
+    "approved_at": "2026-10-11T12:00:00Z",
+    "approved_by": "uuid"
+  },
+  "meta": {"request_id": "req_example"}
+}
+```
+
+Error responses:
+- `404 NOT_FOUND`: Proposal not found or caller is not the CRM owner.
+- `409 CONFLICT`: Proposal is stale (CRM configuration changed since creation).
+- `422 VALIDATION_ERROR`: Proposal is not pending, or proposed_change type is not allowlisted.
+- `403 FORBIDDEN`: CRM is archived (cannot modify archived CRMs).
+
+Approval validates:
+1. Caller is authenticated and owns the CRM.
+2. CRM is active (not archived).
+3. Proposal is pending.
+4. CRM configuration has not changed since proposal creation (staleness check).
+5. proposed_change type is allowlisted (`workflow.update` or `workflow.create`).
+
+Approval does NOT apply the proposed change. Use the apply endpoint after approval.
+
+### 5.15 Apply an approved proposal
+
+`POST /api/v1/crm/{crm_id}/evolution/proposals/{proposal_id}/apply`
+
+Auth: required (authenticated users only, no service_role bypass).
+
+Applies the approved change atomically in a single transaction. Only allowlisted change types are executed. Never executes arbitrary SQL or AI-generated code.
+
+**Transaction Atomicity**: All of the following happen in one transaction:
+1. Workflow mutation (update actions or create new workflow)
+2. CRM configuration_version increment
+3. Proposal status transition to 'applied'
+4. Audit log insertion
+
+If any step fails, the entire transaction rolls back and the proposal status is set to 'failed'.
+
+**Concurrency**: Locks both the proposal and CRM rows (SELECT FOR UPDATE) to prevent concurrent modification.
+
+Request: empty body.
+
+Success `200`:
+
+```json
+{
+  "data": {
+    "proposal_id": "uuid",
+    "status": "applied",
+    "summary": "Follow up sooner after a demo.",
+    "proposed_change": {
+      "type": "workflow.update",
+      "workflow_id": "uuid",
+      "delay_hours": 12
+    },
+    "evidence": [],
+    "approved_at": "2026-10-11T12:00:00Z",
+    "approved_by": "uuid",
+    "applied_at": "2026-10-11T12:01:00Z",
+    "applied_by": "uuid"
+  },
+  "meta": {"request_id": "req_example"}
+}
+```
+
+Error responses:
+- `404 NOT_FOUND`: Proposal not found or caller is not the CRM owner.
+- `409 CONFLICT`: Proposal is stale (configuration changed since approval).
+- `422 VALIDATION_ERROR`: Proposal is not approved, or change type validation failed.
+- `500 INTERNAL_ERROR`: Application failed. Proposal status is set to `failed`; database diagnostics remain server-side and are not returned.
+
+Allowlisted change types:
+- `workflow.update`: Updates `workflow.actions[0].delay_hours`. Validates workflow exists and belongs to CRM. Validates workflow has at least one action. Validates `workflow_id` is a valid UUID and `delay_hours` is a valid integer in range 0-8760. Increments CRM `configuration_version`. Captures old and new workflow state in audit log.
+- `workflow.create`: Creates a new workflow in `draft` status. Validates:
+  - `name`: non-empty string
+  - `trigger`: JSONB object with required `type` field from allowlist: `record.created`, `record.updated`, `record.stage_changed`
+  - `actions`: optional JSONB array; if provided, must be non-empty and each action must have a `type` field from allowlist: `create_follow_up_task`, `notify_owner`, `send_email`; `create_follow_up_task` requires `delay_hours`
+  - Defaults to `[{"type": "create_follow_up_task", "delay_hours": 24}]` if not provided
+  - Increments CRM `configuration_version`
+
+Application is atomic:
+1. Validates proposal is approved.
+2. Re-checks staleness.
+3. Validates change type and fields.
+4. Applies the change to the target entity (workflow).
+5. Updates proposal status to `applied`.
+6. Logs application to audit_logs.
+
+If application fails, proposal status is set to `failed` with `application_error` recorded for server-side diagnostics. Raw database errors are not returned by the API.
+
+### 5.16 Reject a proposal
 
 `POST /api/v1/crm/{crm_id}/evolution/proposals/{proposal_id}/reject`
 
