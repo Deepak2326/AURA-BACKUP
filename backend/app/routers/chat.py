@@ -38,6 +38,7 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     messages: list[ChatMessage] = Field(..., min_length=1, max_length=40)
     generate_now: bool = False
+    crm_type: str | None = Field(default=None, max_length=120)  # optional context from UI chip
 
 
 class ChatResponse(BaseModel):
@@ -144,7 +145,7 @@ def _call_ollama_chat(messages: list[dict], system: str, timeout: float = 120.0)
     return None
 
 
-def _call_ollama_generate(messages: list[dict], timeout: float = 120.0) -> str | None:
+def _call_ollama_generate(messages: list[dict], timeout: float = 120.0, crm_type: str | None = None) -> str | None:
     """Call Ollama to generate a CRM JSON from the conversation. Returns raw text."""
     import httpx
 
@@ -154,10 +155,12 @@ def _call_ollama_generate(messages: list[dict], timeout: float = 120.0) -> str |
         for m in messages
     )
 
+    crm_type_hint = f"\nThe user has confirmed this is a '{crm_type}' CRM.\n" if crm_type else ""
+
     prompt = (
         f"<|im_start|>system\n{_GENERATOR_SYSTEM}<|im_end|>\n"
         f"<|im_start|>user\n"
-        f"Based on this conversation, generate the CRM JSON:\n\n{convo_text}"
+        f"Based on this conversation, generate the CRM JSON:{crm_type_hint}\n\n{convo_text}"
         f"<|im_end|>\n"
         f"<|im_start|>assistant\n"
     )
@@ -228,7 +231,7 @@ async def chat(
     if body.generate_now:
         warnings: list[str] = []
 
-        raw = _call_ollama_generate(messages_dicts)
+        raw = _call_ollama_generate(messages_dicts, crm_type=body.crm_type)
         config_dict: dict[str, Any] | None = None
 
         if raw:
@@ -264,7 +267,16 @@ async def chat(
     except ValueError as exc:
         return error_response(502, "AI_PROVIDER_ERROR", str(exc))
 
-    reply = _call_ollama_chat(messages_dicts, _CONSULTANT_SYSTEM)
+    # Enrich the system prompt with the CRM type chip selection when provided
+    system = _CONSULTANT_SYSTEM
+    if body.crm_type:
+        system = (
+            f"The user has already indicated they want to build a '{body.crm_type}' CRM. "
+            f"Use this as confirmed context — do not ask about CRM type again.\n\n"
+            + _CONSULTANT_SYSTEM
+        )
+
+    reply = _call_ollama_chat(messages_dicts, system)
     fallback_used = reply is None
 
     if fallback_used:
